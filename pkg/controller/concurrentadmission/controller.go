@@ -19,6 +19,7 @@ package concurrentadmission
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -48,6 +50,7 @@ import (
 	controllerconsts "sigs.k8s.io/kueue/pkg/controller/constants"
 	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	"sigs.k8s.io/kueue/pkg/util/resourcegroups"
 	"sigs.k8s.io/kueue/pkg/util/roletracker"
 	"sigs.k8s.io/kueue/pkg/workload"
 	"sigs.k8s.io/kueue/pkg/workload/concurrentadmission"
@@ -110,7 +113,7 @@ func (r *variantReconciler) setupWithManager(mgr ctrl.Manager, cfg *configapi.Co
 					return []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(obj)}}
 				}
 				if concurrentadmission.IsVariant(obj) {
-					return []reconcile.Request{{NamespacedName: client.ObjectKey{Namespace: obj.Namespace, Name: concurrentadmission.GetParentWorkloadName(obj)}}}
+					return []reconcile.Request{{Namespace: obj.Namespace, Name: concurrentadmission.GetParentWorkloadName(obj)}}
 				}
 				return nil
 			}),
@@ -142,7 +145,7 @@ func clusterQueueFlavorsChanged() predicate.TypedPredicate[*kueue.ClusterQueue] 
 		DeleteFunc:  func(event.TypedDeleteEvent[*kueue.ClusterQueue]) bool { return false },
 		GenericFunc: func(event.TypedGenericEvent[*kueue.ClusterQueue]) bool { return false },
 		UpdateFunc: func(e event.TypedUpdateEvent[*kueue.ClusterQueue]) bool {
-			return !slices.EqualFunc(e.ObjectOld.Spec.ResourceGroups, e.ObjectNew.Spec.ResourceGroups,
+			return !slices.EqualFunc(resourcegroups.EffectiveResourceGroups(e.ObjectOld), resourcegroups.EffectiveResourceGroups(e.ObjectNew),
 				func(a, b kueue.ResourceGroup) bool {
 					return slices.EqualFunc(a.Flavors, b.Flavors,
 						func(x, y kueue.FlavorQuotas) bool {
@@ -197,8 +200,14 @@ func (r *variantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
-	flavorOrder := make(map[kueue.ResourceFlavorReference]int, len(cq.Spec.ResourceGroups[0].Flavors))
-	for i, flavor := range cq.Spec.ResourceGroups[0].Flavors {
+	cqResourceGroups := resourcegroups.EffectiveResourceGroups(cq)
+	var cqFlavors []kueue.FlavorQuotas
+	if len(cqResourceGroups) > 0 {
+		cqFlavors = cqResourceGroups[0].Flavors
+	}
+
+	flavorOrder := make(map[kueue.ResourceFlavorReference]int, len(cqFlavors))
+	for i, flavor := range cqFlavors {
 		flavorOrder[flavor.Name] = i
 	}
 	variants = sortVariantsByFlavorOrder(variants, flavorOrder)
@@ -206,10 +215,19 @@ func (r *variantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	log = log.WithValues("clusterQueue", cq.Name)
 	log.V(2).Info("Found Workload family and ClusterQueue", "variants", klog.KObjSlice(variants))
 
-	// TODO: If ConcurrentAdmission is no longer enabled for this CQ, delete parent and variants.
+	if cq.Spec.ConcurrentAdmissionPolicy == nil {
+		return r.cleanupParentAndVariants(ctx, log, parent, variants, flavorOrder)
+	}
+	if workloadfinish.IsFinished(parent) {
+		return ctrl.Result{}, r.syncFinished(ctx, parent, variants)
+	}
+	// The garbage collector deletes the variants of a deleting parent, so recreating them only races it.
+	if !parent.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
 
 	log.V(3).Info("Reconciling variants against ClusterQueue flavors", "desired", len(flavorOrder), "actual", len(variants))
-	if err := r.createVariants(ctx, parent, variants, cq.Spec.ResourceGroups[0].Flavors); err != nil {
+	if err := r.createVariants(ctx, parent, variants, cqFlavors); err != nil {
 		return ctrl.Result{}, err
 	}
 	variants, err = r.deleteStaleVariants(ctx, parent, variants, flavorOrder)
@@ -240,7 +258,7 @@ func (r *variantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	if err := r.syncAdmissionStatus(ctx, parent, variants); err != nil {
+	if err := r.syncAdmissionStatus(ctx, parent, variants, flavorOrder, "ConcurrentAdmission", "No variant is running"); err != nil {
 		log.Error(err, "Failed to sync admission status")
 		return ctrl.Result{}, err
 	}
@@ -252,6 +270,50 @@ func (r *variantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 	return ctrl.Result{RequeueAfter: timeToWait}, nil
+}
+
+// cleanupParentAndVariants handles the case where ConcurrentAdmission is no
+// longer enabled for the parent's ClusterQueue. If a variant is already
+// admitted while the parent is not, its admission is promoted onto the
+// parent (reusing the same transfer used in syncAdmissionStatus) so an
+// already-running workload isn't needlessly interrupted. The parent is only
+// evicted if it is admitted without any admitted variant backing that
+// admission. All variants are then deleted and the parent label is
+// removed so this reconciler stops tracking it.
+func (r *variantReconciler) cleanupParentAndVariants(
+	ctx context.Context,
+	log logr.Logger,
+	parent *kueue.Workload,
+	variants []kueue.Workload,
+	flavorOrder map[kueue.ResourceFlavorReference]int,
+) (ctrl.Result, error) {
+	log.V(2).Info("ConcurrentAdmission is no longer enabled for this ClusterQueue, cleaning up parent and variants")
+
+	if err := r.syncAdmissionStatus(ctx, parent, variants, flavorOrder, "ConcurrentAdmissionDisabled", "ConcurrentAdmission is no longer enabled for this ClusterQueue"); err != nil {
+		return ctrl.Result{}, fmt.Errorf("syncing admission status: %w", err)
+	}
+
+	if _, ok := parent.Labels[controllerconsts.ConcurrentAdmissionParentLabelKey]; ok {
+		delete(parent.Labels, controllerconsts.ConcurrentAdmissionParentLabelKey)
+		if err := r.client.Update(ctx, parent); err != nil {
+			return ctrl.Result{}, fmt.Errorf("removing parent label: %w", err)
+		}
+	}
+
+	for i := range variants {
+		v := &variants[i]
+		log.V(2).Info("Deleting variant because ConcurrentAdmission is no longer enabled", "variant", klog.KObj(v))
+		deleted, err := workload.Delete(ctx, r.client, v)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("deleting variant %s: %w", klog.KObj(v), err)
+		}
+		if deleted {
+			r.recorder.Eventf(parent, nil, corev1.EventTypeNormal, ReasonDeletedVariant, ReasonDeletedVariant,
+				"Variant Workload %q deleted; ConcurrentAdmission is no longer enabled for this ClusterQueue", klog.KObj(v))
+		}
+	}
+
+	return ctrl.Result{}, nil
 }
 
 func (r *variantReconciler) getFamilyAndClusterQueue(ctx context.Context, req ctrl.Request) (*kueue.Workload, []kueue.Workload, *kueue.ClusterQueue, error) {
@@ -355,15 +417,13 @@ func (r *variantReconciler) deleteStaleVariants(ctx context.Context, parent *kue
 
 func generateVariant(parent *kueue.Workload, flavor kueue.ResourceFlavorReference) *kueue.Workload {
 	variant := &kueue.Workload{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:          jobframework.GetWorkloadNameForVariant(parent.Name, parent.UID, parent.GroupVersionKind(), string(flavor)),
-			Namespace:     parent.Namespace,
-			Labels:        parent.Labels,
-			Annotations:   parent.Annotations,
-			ManagedFields: parent.ManagedFields,
-		},
-		Spec:   parent.Spec,
-		Status: parent.Status,
+		Name:          jobframework.GetWorkloadNameForVariant(parent.Name, parent.UID, parent.GroupVersionKind(), string(flavor)),
+		Namespace:     parent.Namespace,
+		Labels:        maps.Clone(parent.Labels),
+		Annotations:   maps.Clone(parent.Annotations),
+		ManagedFields: parent.ManagedFields,
+		Spec:          parent.Spec,
+		Status:        parent.Status,
 	}
 	variant.Spec.PreemptionGates = slices.Clone(variant.Spec.PreemptionGates)
 	workload.EnsurePreemptionGateOnSpec(variant, controllerconsts.ConcurrentAdmissionPreemptionGate)
@@ -655,7 +715,30 @@ func (r *variantReconciler) syncPodsReadyCond(parent, variant *kueue.Workload) b
 	return apimeta.SetStatusCondition(&variant.Status.Conditions, *parentCond)
 }
 
-func (r *variantReconciler) syncAdmissionStatus(ctx context.Context, parent *kueue.Workload, variants []kueue.Workload) error {
+// hasRemovedAdmissionFlavor reports whether an assigned flavor is no longer
+// available for concurrent admission in the ClusterQueue.
+func hasRemovedAdmissionFlavor(wl *kueue.Workload, flavorOrder map[kueue.ResourceFlavorReference]int) bool {
+	if wl.Status.Admission == nil {
+		return false
+	}
+
+	for _, assignment := range wl.Status.Admission.PodSetAssignments {
+		for _, flavor := range assignment.Flavors {
+			if _, found := flavorOrder[flavor]; !found {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (r *variantReconciler) syncAdmissionStatus(
+	ctx context.Context,
+	parent *kueue.Workload,
+	variants []kueue.Workload,
+	flavorOrder map[kueue.ResourceFlavorReference]int,
+	evictReason, evictMessage string,
+) error {
 	log := ctrl.LoggerFrom(ctx)
 	if workloadfinish.IsFinished(parent) {
 		return r.syncFinished(ctx, parent, variants)
@@ -666,10 +749,28 @@ func (r *variantReconciler) syncAdmissionStatus(ctx context.Context, parent *kue
 	case admittedVariant == nil && workload.IsAdmitted(parent):
 		log.V(2).Info("Parent admitted and no Variant is admitted, evicting parent", "parent", klog.KObj(parent))
 		err := workloadpatching.PatchAdmissionStatus(ctx, r.client, parent, r.clock, func(wl *kueue.Workload) (bool, error) {
-			return workloadevict.SetEvictedCondition(wl, r.clock.Now(), "ConcurrentAdmission", "No variant is running"), nil
+			return workloadevict.SetEvictedCondition(wl, r.clock.Now(), evictReason, evictMessage), nil
 		})
 		if err != nil {
 			return fmt.Errorf("clearing admission: %w", err)
+		}
+	case admittedVariant != nil && workload.IsAdmitted(parent) && hasRemovedAdmissionFlavor(parent, flavorOrder):
+		// Preserve an existing eviction while waiting for the parent to release quota.
+		if workloadevict.IsEvicted(parent) {
+			return nil
+		}
+
+		log.V(2).Info("Parent admitted flavor is no longer in the ClusterQueue, evicting parent", "parent", klog.KObj(parent))
+
+		if err := workloadpatching.PatchAdmissionStatus(ctx, r.client, parent, r.clock, func(wl *kueue.Workload) (bool, error) {
+			return workloadevict.SetEvictedCondition(
+				wl,
+				r.clock.Now(),
+				"ConcurrentAdmission",
+				"The admitted flavor is no longer in the ClusterQueue",
+			), nil
+		}); err != nil {
+			return fmt.Errorf("evicting parent: %w", err)
 		}
 	case admittedVariant != nil && !workload.IsAdmitted(parent):
 		log.V(2).Info("Parent not admitted and Variant admitted, syncing their status", "parent", klog.KObj(parent), "Variant", klog.KObj(admittedVariant))
@@ -679,9 +780,21 @@ func (r *variantReconciler) syncAdmissionStatus(ctx context.Context, parent *kue
 		}); err != nil {
 			return client.IgnoreNotFound(err)
 		}
+		// The Parent can keep Ready checks after losing its quota reservation, with or without
+		// an eviction (for example when its LocalQueue is deleted). Reset them before the copy,
+		// as the pod set updates of a Ready check cannot change.
+		if err := r.resetParentChecks(ctx, parent); err != nil {
+			return client.IgnoreNotFound(err)
+		}
 		if err := workloadpatching.PatchAdmissionStatus(ctx, r.client, parent, r.clock, func(wl *kueue.Workload) (bool, error) {
 			workload.SetQuotaReservation(wl, admittedVariant.Status.Admission, r.clock)
 			workload.SetAdmittedCondition(wl, r.clock.Now(), "Admitted", fmt.Sprintf("The variant %s is admitted", admittedVariant.Name))
+			// The Parent mirrors the admission checks of the admitted Variant, so that the job
+			// is started with their pod set updates.
+			wl.Status.AdmissionChecks = make([]kueue.AdmissionCheckState, len(admittedVariant.Status.AdmissionChecks))
+			for i := range admittedVariant.Status.AdmissionChecks {
+				admittedVariant.Status.AdmissionChecks[i].DeepCopyInto(&wl.Status.AdmissionChecks[i])
+			}
 			log.V(2).Info("Parent is not admitted but a variant is admitted, updating parent to admitted", "parent", klog.KObj(parent), "admittedVariant", klog.KObj(admittedVariant))
 			return true, nil
 		}); err != nil {
@@ -698,8 +811,27 @@ func (r *variantReconciler) syncAdmissionStatus(ctx context.Context, parent *kue
 
 	case admittedVariant == nil && !workload.IsAdmitted(parent):
 		log.V(2).Info("Parent and Variants are both not admitted, no sync needed", "parent", klog.KObj(parent))
+		// Nothing else resets the checks the Parent mirrored from an earlier Variant, so do it
+		// once the Parent has released its quota reservation.
+		if !workload.HasQuotaReservation(parent) {
+			if err := r.resetParentChecks(ctx, parent); err != nil {
+				return client.IgnoreNotFound(err)
+			}
+		}
 	}
 	return nil
+}
+
+// resetParentChecks sets the admission checks of the Parent, which mirror the ones of a
+// previously admitted Variant, back to Pending. It is a no-op if none is set.
+func (r *variantReconciler) resetParentChecks(ctx context.Context, parent *kueue.Workload) error {
+	if !slices.ContainsFunc(parent.Status.AdmissionChecks, func(c kueue.AdmissionCheckState) bool { return c.State != kueue.CheckStatePending }) {
+		return nil
+	}
+	return workloadpatching.PatchAdmissionStatus(ctx, r.client, parent, r.clock, func(wl *kueue.Workload) (bool, error) {
+		workloadevict.ResetChecksOnEviction(wl, r.clock.Now())
+		return true, nil
+	})
 }
 
 func (r *variantReconciler) logger() logr.Logger {
@@ -777,7 +909,7 @@ func firstCandidateVariant(log logr.Logger, admissibleVariants []*kueue.Workload
 		}
 		if workload.BlockedOnPreemptionGatesCondition(wl) == nil {
 			quotaReserved := apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadQuotaReserved)
-			if quotaReserved == nil {
+			if quotaReserved == nil || quotaReserved.Reason == kueue.WorkloadQuotaReservedReasonPendingEvaluation {
 				wlLog.Info("Variant has not been evaluated for admission yet")
 				return nil
 			}
@@ -846,9 +978,12 @@ func getAdmittedVariant(variants []kueue.Workload) *kueue.Workload {
 }
 
 func migrationMode(cq *kueue.ClusterQueue) kueue.ConcurrentAdmissionMigrationMode {
-	if cq.Spec.ConcurrentAdmissionPolicy == nil ||
-		cq.Spec.ConcurrentAdmissionPolicy.Migration.Mode == "" {
+	if cq.Spec.ConcurrentAdmissionPolicy == nil {
 		return kueue.ConcurrentAdmissionTryPreferredFlavors
 	}
-	return cq.Spec.ConcurrentAdmissionPolicy.Migration.Mode
+	mode := ptr.Deref(cq.Spec.ConcurrentAdmissionPolicy.Migration.Mode, "")
+	if mode == "" {
+		return kueue.ConcurrentAdmissionTryPreferredFlavors
+	}
+	return mode
 }

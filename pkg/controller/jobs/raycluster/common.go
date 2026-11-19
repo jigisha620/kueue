@@ -21,10 +21,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/go-logr/logr"
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+	rayctrlcommon "github.com/ray-project/kuberay/ray-operator/controllers/ray/common"
 	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,9 +41,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	jobframeworktas "sigs.k8s.io/kueue/pkg/controller/jobframework/tas"
+	"sigs.k8s.io/kueue/pkg/controller/jobs/ray"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/podset"
+	"sigs.k8s.io/kueue/pkg/util/equality"
 	utilpodset "sigs.k8s.io/kueue/pkg/util/podset"
 	utilresource "sigs.k8s.io/kueue/pkg/util/resource"
 	"sigs.k8s.io/kueue/pkg/workloadslicing"
@@ -57,24 +65,46 @@ const (
 	RayClusterGenerationAnnotation = "kueue.x-k8s.io/raycluster-generation"
 )
 
+var (
+	// errRedisCleanupMissingRayContainer is returned when GCS fault tolerance is
+	// enabled but the head Pod template does not include the Ray container needed
+	// to account for the Redis cleanup Job's resource requests.
+	errRedisCleanupMissingRayContainer = errors.New("cannot account for Redis cleanup resources: head pod template must include the Ray container")
+	// errPodSetNameMismatch is returned when a RayCluster's worker group has no
+	// matching PodSet in the Ray object's spec.
+	errPodSetNameMismatch = errors.New("PodSet name mismatch")
+	// errUnmarshalPodSetReplicaSizes is returned when the
+	// RayClusterPodsetReplicaSizesAnnotation value cannot be parsed.
+	errUnmarshalPodSetReplicaSizes = fmt.Errorf("failed to unmarshal %s annotation", RayClusterPodsetReplicaSizesAnnotation)
+)
+
 // effectiveWorkerCount returns the effective worker pod count for a worker
-// group: Replicas scaled by NumOfHosts, with Replicas defaulting to 1 when
-// unset. BuildPodSets, UpdatePodSets, and the MultiKueue elastic replica sync
+// group, respecting KubeRay's min/max replica bounds and NumOfHosts.
+// BuildPodSets, UpdatePodSets, and the MultiKueue elastic replica sync
 // all call this so the per-group count derivation stays in one place.
 func effectiveWorkerCount(wgs *rayv1.WorkerGroupSpec) int32 {
-	count := int32(1)
-	if wgs.Replicas != nil {
-		count = *wgs.Replicas
+	var replicas int32
+	minReplicas := ptr.Deref(wgs.MinReplicas, int32(0))
+	maxReplicas := ptr.Deref(wgs.MaxReplicas, int32(math.MaxInt32))
+	// Replicas is defaulted by the CRD, but may be nil before admission.
+	switch {
+	case wgs.Replicas == nil || *wgs.Replicas < minReplicas:
+		replicas = minReplicas
+	case *wgs.Replicas > maxReplicas:
+		replicas = maxReplicas
+	default:
+		replicas = *wgs.Replicas
 	}
-	if wgs.NumOfHosts > 1 {
-		count *= wgs.NumOfHosts
-	}
-	return count
+	return replicas * max(wgs.NumOfHosts, 1)
 }
 
 // BuildPodSets builds PodSets from RayClusterSpec.
 func BuildPodSets(rayClusterSpec *rayv1.RayClusterSpec, annotations map[string]string) ([]kueue.PodSet, error) {
 	podSets := make([]kueue.PodSet, 0)
+	var collectorOptions *rayv1.CollectorOptions
+	if rayClusterSpec.HistoryServerOptions != nil {
+		collectorOptions = rayClusterSpec.HistoryServerOptions.CollectorOptions
+	}
 
 	// head
 	headPodSet := kueue.PodSet{
@@ -83,7 +113,7 @@ func BuildPodSets(rayClusterSpec *rayv1.RayClusterSpec, annotations map[string]s
 		Count:    1,
 	}
 	if features.Enabled(features.TopologyAwareScheduling) {
-		topologyRequest, err := jobframework.NewPodSetTopologyRequest(
+		topologyRequest, err := jobframeworktas.NewPodSetTopologyRequest(
 			&rayClusterSpec.HeadGroupSpec.Template.ObjectMeta).Build()
 		if err != nil {
 			return nil, err
@@ -104,6 +134,12 @@ func BuildPodSets(rayClusterSpec *rayv1.RayClusterSpec, annotations map[string]s
 			autoscalerContainer(rayClusterSpec.AutoscalerOptions),
 		)
 	}
+	if collectorOptions != nil {
+		headPodSet.Template.Spec.Containers = append(
+			headPodSet.Template.Spec.Containers,
+			historyServerCollectorContainer(collectorOptions),
+		)
+	}
 	podSets = append(podSets, headPodSet)
 
 	// workers
@@ -115,11 +151,21 @@ func BuildPodSets(rayClusterSpec *rayv1.RayClusterSpec, annotations map[string]s
 			Count:    effectiveWorkerCount(wgs),
 		}
 		if features.Enabled(features.TopologyAwareScheduling) {
-			topologyRequest, err := jobframework.NewPodSetTopologyRequest(&wgs.Template.ObjectMeta).Build()
+			topologyRequest, err := buildWorkerTopologyRequest(wgs)
 			if err != nil {
 				return nil, err
 			}
 			workerPodSet.TopologyRequest = topologyRequest
+		}
+		if features.Enabled(features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp) &&
+			annotations[constants.ElasticJobScaleUpStrategyAnnotationKey] == constants.ElasticJobScaleUpStrategyPartial {
+			workerPodSet.MinCount = new(effectiveWorkerCount(wgs))
+		}
+		if collectorOptions != nil {
+			workerPodSet.Template.Spec.Containers = append(
+				workerPodSet.Template.Spec.Containers,
+				historyServerCollectorContainer(collectorOptions),
+			)
 		}
 		podSets = append(podSets, workerPodSet)
 	}
@@ -127,9 +173,36 @@ func BuildPodSets(rayClusterSpec *rayv1.RayClusterSpec, annotations map[string]s
 	return podSets, nil
 }
 
+func buildWorkerTopologyRequest(wgs *rayv1.WorkerGroupSpec) (*kueue.PodSetTopologyRequest, error) {
+	podIndexLabel, subGroupIndexLabel := workerTopologyIndexLabels(wgs.Replicas, wgs.NumOfHosts)
+	return jobframeworktas.NewPodSetTopologyRequest(&wgs.Template.ObjectMeta).
+		SubGroupCount(wgs.Replicas).
+		PodIndexLabel(podIndexLabel).
+		SubGroupIndexLabel(subGroupIndexLabel).
+		Build()
+}
+
+func workerTopologyIndexLabels(replicas *int32, numOfHosts int32) (podIndexLabel, subGroupIndexLabel *string) {
+	if numOfHosts > 1 {
+		// For multi-host replicas, kuberay sets both a host index and
+		// replica index label, where the replica index denotes a
+		// subgroup that should schedule together (e.g. on a single TPU
+		// slice).
+		podIndexLabel = new(rayutils.RayHostIndexKey)
+		if ptr.Deref(replicas, 1) > 1 {
+			subGroupIndexLabel = new(rayutils.RayWorkerReplicaIndexKey)
+		}
+	} else if ptr.Deref(replicas, 1) > 1 {
+		// In the more common single-host case, kuberay only sets a
+		// replica index.
+		podIndexLabel = new(rayutils.RayWorkerReplicaIndexKey)
+	}
+	return podIndexLabel, subGroupIndexLabel
+}
+
 func accountForRedisCleanupInHeadPodSet(headPodSet *kueue.PodSet) error {
 	if len(headPodSet.Template.Spec.Containers) <= rayutils.RayContainerIndex {
-		return errors.New("cannot account for Redis cleanup resources: head pod template must include the Ray container")
+		return errRedisCleanupMissingRayContainer
 	}
 
 	headContainer := &headPodSet.Template.Spec.Containers[rayutils.RayContainerIndex]
@@ -184,6 +257,20 @@ func autoscalerContainer(opts *rayv1.AutoscalerOptions) corev1.Container {
 	}
 }
 
+// historyServerCollectorContainer returns a container mirroring the collector
+// that KubeRay injects into every head and worker Pod when History Server
+// collection is configured. Only the fields that affect quota and PodSpec
+// validation are kept: the image is required by ProvisioningRequest, and is
+// empty when unset because KubeRay rejects a missing collectorOptions.image.
+func historyServerCollectorContainer(opts *rayv1.CollectorOptions) corev1.Container {
+	collector := rayctrlcommon.BuildCollectorContainer(opts, rayv1.RayNodeType(""), "", "", "", nil)
+	return corev1.Container{
+		Name:      collector.Name,
+		Image:     collector.Image,
+		Resources: *collector.Resources.DeepCopy(),
+	}
+}
+
 func ExpectedPodSetsCount(rayClusterSpec *rayv1.RayClusterSpec) int {
 	return len(rayClusterSpec.WorkerGroupSpecs) + 1
 }
@@ -207,9 +294,17 @@ func UpdatePodSets(ctx context.Context, podSets []kueue.PodSet, c client.Client,
 				if apierrors.IsNotFound(err) {
 					log.V(2).Info("RayCluster does not exist, do not update podsets",
 						"rayCluster", rayClusterName)
-				} else {
-					return nil, fmt.Errorf("failed to get RayCluster %s: %w", rayClusterName, err)
+					// On a MultiKueue manager the child RayCluster only exists on
+					// the worker cluster; its per-group counts are reflected here
+					// as an annotation by the MultiKueue workload controller.
+					// Anywhere else NotFound is transient (the child is not
+					// created yet) and the spec-derived counts stand.
+					if isManagedByMultiKueue(object) {
+						return applyRuntimeCountsAnnotation(log, podSets, object), nil
+					}
+					return podSets, nil
 				}
+				return nil, fmt.Errorf("failed to get RayCluster %s: %w", rayClusterName, err)
 			} else {
 				// Create a map of podSets from Ray object spec for quick lookup by name
 				podSetMap := make(map[kueue.PodSetReference]*kueue.PodSet)
@@ -224,7 +319,7 @@ func UpdatePodSets(ctx context.Context, podSets []kueue.PodSet, c client.Client,
 
 					podSet, exists := podSetMap[podSetName]
 					if !exists {
-						return nil, fmt.Errorf("PodSet name mismatch: RayCluster %s has worker group %s which is not found in Ray object %s spec", rayClusterName, wgs.GroupName, object.GetName())
+						return nil, fmt.Errorf("%w: RayCluster %s has worker group %s which is not found in Ray object %s spec", errPodSetNameMismatch, rayClusterName, wgs.GroupName, object.GetName())
 					}
 
 					if wgs.Replicas == nil {
@@ -242,6 +337,13 @@ func UpdatePodSets(ctx context.Context, podSets []kueue.PodSet, c client.Client,
 							"oldCount", podSet.Count,
 							"newCount", count)
 						podSet.Count = count
+						if features.Enabled(features.TopologyAwareScheduling) {
+							topologyRequest, err := buildWorkerTopologyRequest(wgs)
+							if err != nil {
+								return nil, err
+							}
+							podSet.TopologyRequest = topologyRequest
+						}
 					}
 				}
 			}
@@ -258,6 +360,7 @@ func UpdateRayClusterSpecToRunWithPodSetsInfo(log logr.Logger, rayClusterSpec *r
 	if err := podset.Merge(log, &headPod.ObjectMeta, &headPod.Spec, info); err != nil {
 		return err
 	}
+	jobframeworktas.DefaultPodIndexOffsetForPodSetGroup(&headPod.ObjectMeta)
 
 	// workers
 	for index := range rayClusterSpec.WorkerGroupSpecs {
@@ -266,6 +369,7 @@ func UpdateRayClusterSpecToRunWithPodSetsInfo(log logr.Logger, rayClusterSpec *r
 		if err := podset.Merge(log, &workerPod.ObjectMeta, &workerPod.Spec, info); err != nil {
 			return err
 		}
+		jobframeworktas.DefaultPodIndexOffsetForPodSetGroup(&workerPod.ObjectMeta)
 	}
 
 	return nil
@@ -298,6 +402,10 @@ func RestorePodSetsInfo(ctx context.Context, rayClusterSpec *rayv1.RayClusterSpe
 func ValidateCreate(object client.Object, rayClusterSpec *rayv1.RayClusterSpec, rayClusterSpecPath *field.Path) field.ErrorList {
 	var allErrors field.ErrorList
 
+	if len(rayClusterSpec.HeadGroupSpec.Template.Spec.Containers) == 0 {
+		allErrors = append(allErrors, field.Required(rayClusterSpecPath.Child("headGroupSpec", "template", "spec", "containers"), "must have at least one container"))
+	}
+
 	// Should not use auto scaler. Once the resources are reserved by queue the cluster should do its best to use them.
 	if ptr.Deref(rayClusterSpec.EnableInTreeAutoscaling, false) && !workloadslicing.Enabled(object) {
 		allErrors = append(
@@ -305,7 +413,19 @@ func ValidateCreate(object client.Object, rayClusterSpec *rayv1.RayClusterSpec, 
 			field.Invalid(
 				rayClusterSpecPath.Child("enableInTreeAutoscaling"),
 				rayClusterSpec.EnableInTreeAutoscaling,
-				"a kueue managed job should only use autoscaling when workload slicing is enabled",
+				fmt.Sprintf("a kueue-managed job can use autoscaling only as an elastic job: "+
+					"enable the ElasticJobsViaWorkloadSlices feature gate and set the %q: %q annotation",
+					workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue),
+			),
+		)
+	}
+	if ptr.Deref(rayClusterSpec.EnableInTreeAutoscaling, false) && workloadslicing.Enabled(object) &&
+		isManagedByMultiKueue(object) && !features.Enabled(features.MultiKueueRayInTreeAutoscaling) {
+		allErrors = append(
+			allErrors,
+			field.Forbidden(
+				rayClusterSpecPath.Child("enableInTreeAutoscaling"),
+				fmt.Sprintf("in-tree autoscaling for a MultiKueue-managed elastic job requires enabling the %s feature gate", features.MultiKueueRayInTreeAutoscaling),
 			),
 		)
 	}
@@ -328,6 +448,24 @@ func ValidateCreate(object client.Object, rayClusterSpec *rayv1.RayClusterSpec, 
 	return allErrors
 }
 
+// EquivalenceOptions returns the ComparePodSetsOption shared by all Ray job
+// types. Unless KubeRayEvictOnInconsistentTopologyRequest is enabled, it
+// ignores the TopologyRequest index and subgroup fields, so that workloads
+// created before rank-based ordering was added are not evicted as out of sync.
+func EquivalenceOptions() []equality.ComparePodSetsOption {
+	if !features.Enabled(features.KubeRayEvictOnInconsistentTopologyRequest) {
+		return []equality.ComparePodSetsOption{equality.WithIgnoreTopologyIndexLabels()}
+	}
+	return nil
+}
+
+// CanDefaultManagedBy reports whether the spec.managedBy of a Ray job can be
+// defaulted to MultiKueue: it must be unset or set to the KubeRay controller.
+func CanDefaultManagedBy(managedBy *string) bool {
+	return features.Enabled(features.MultiKueue) &&
+		(managedBy == nil || *managedBy == rayutils.KubeRayController)
+}
+
 func ValidateTopologyRequest(
 	ctx context.Context,
 	c client.Client,
@@ -342,24 +480,24 @@ func ValidateTopologyRequest(
 
 	podSets, podSetsErr := jobframework.JobPodSets(ctx, job, c)
 
-	allErrs = append(allErrs, jobframework.ValidateTASPodSetRequest(headGroupMetaPath, &rayClusterSpec.HeadGroupSpec.Template.ObjectMeta)...)
+	allErrs = append(allErrs, jobframeworktas.ValidateTASPodSetRequest(headGroupMetaPath, &rayClusterSpec.HeadGroupSpec.Template.ObjectMeta)...)
 
 	if podSetsErr == nil {
 		headGroupPodSetName := utilpodset.FindPodSetByName(podSets, headGroupPodSetName)
-		allErrs = append(allErrs, jobframework.ValidateSliceSizeAnnotationUpperBound(headGroupMetaPath, &rayClusterSpec.HeadGroupSpec.Template.ObjectMeta, headGroupPodSetName)...)
-		allErrs = append(allErrs, jobframework.ValidatePodSetGroupingTopology(podSets, BuildPodSetAnnotationsPathByNameMap(rayClusterSpec, headGroupMetaPath, workerGroupSpecsPath))...)
+		allErrs = append(allErrs, jobframeworktas.ValidateSliceSizeAnnotationUpperBound(headGroupMetaPath, &rayClusterSpec.HeadGroupSpec.Template.ObjectMeta, headGroupPodSetName)...)
+		allErrs = append(allErrs, jobframeworktas.ValidatePodSetGroupingTopology(podSets, buildPodSetAnnotationsPathByNameMap(rayClusterSpec, headGroupMetaPath, workerGroupSpecsPath))...)
 	}
 
 	for i, wgs := range rayClusterSpec.WorkerGroupSpecs {
 		workerGroupMetaPath := workerGroupSpecsPath.Index(i).Child("template", "metadata")
-		allErrs = append(allErrs, jobframework.ValidateTASPodSetRequest(workerGroupMetaPath, &rayClusterSpec.WorkerGroupSpecs[i].Template.ObjectMeta)...)
+		allErrs = append(allErrs, jobframeworktas.ValidateTASPodSetRequest(workerGroupMetaPath, &rayClusterSpec.WorkerGroupSpecs[i].Template.ObjectMeta)...)
 
 		if podSetsErr != nil {
 			continue
 		}
 
 		workerPodSetName := utilpodset.FindPodSetByName(podSets, kueue.NewPodSetReference(wgs.GroupName))
-		allErrs = append(allErrs, jobframework.ValidateSliceSizeAnnotationUpperBound(workerGroupMetaPath, &rayClusterSpec.WorkerGroupSpecs[i].Template.ObjectMeta, workerPodSetName)...)
+		allErrs = append(allErrs, jobframeworktas.ValidateSliceSizeAnnotationUpperBound(workerGroupMetaPath, &rayClusterSpec.WorkerGroupSpecs[i].Template.ObjectMeta, workerPodSetName)...)
 	}
 
 	if len(allErrs) > 0 {
@@ -369,7 +507,7 @@ func ValidateTopologyRequest(
 	return nil, podSetsErr
 }
 
-func BuildPodSetAnnotationsPathByNameMap(rayClusterSpec *rayv1.RayClusterSpec, headGroupMetaPath, workerGroupSpecsPath *field.Path) map[kueue.PodSetReference]*field.Path {
+func buildPodSetAnnotationsPathByNameMap(rayClusterSpec *rayv1.RayClusterSpec, headGroupMetaPath, workerGroupSpecsPath *field.Path) map[kueue.PodSetReference]*field.Path {
 	podSetAnnotationsPathByName := make(map[kueue.PodSetReference]*field.Path)
 	podSetAnnotationsPathByName[headGroupPodSetName] = headGroupMetaPath.Child("annotations")
 	for i, wgs := range rayClusterSpec.WorkerGroupSpecs {
@@ -387,34 +525,172 @@ func GetWorkloadNameExtraPart(objectMeta metav1.Object) string {
 	return extra
 }
 
-// ComparePodSetCounts returns true if any PodSet count differs from referenceCounts.
-func ComparePodSetCounts(podSets []kueue.PodSet, referenceCounts map[kueue.PodSetReference]int32) bool {
-	if len(podSets) != len(referenceCounts) {
-		return true
+// isManagedByMultiKueue reports whether the job is the manager cluster's copy
+// of a MultiKueue-dispatched job. Worker copies have spec.managedBy cleared.
+func isManagedByMultiKueue(object client.Object) bool {
+	switch job := object.(type) {
+	case *rayv1.RayCluster:
+		return ptr.Deref(job.Spec.ManagedBy, "") == kueue.MultiKueueControllerName
+	case *rayv1.RayJob:
+		return ptr.Deref(job.Spec.ManagedBy, "") == kueue.MultiKueueControllerName
+	case *rayv1.RayService:
+		return ptr.Deref(job.Spec.ManagedBy, "") == kueue.MultiKueueControllerName
+	default:
+		return false
 	}
-	for _, ps := range podSets {
-		if refCount, ok := referenceCounts[ps.Name]; !ok || ps.Count != refCount {
-			return true
-		}
-	}
-	return false
 }
 
-// ParsePodSetReplicaSizes parses the PodsetReplicaSizesAnnotation value into a map.
+func getRayClusterSpec(object client.Object) *rayv1.RayClusterSpec {
+	switch job := object.(type) {
+	case *rayv1.RayCluster:
+		return &job.Spec
+	case *rayv1.RayJob:
+		return job.Spec.RayClusterSpec
+	case *rayv1.RayService:
+		return &job.Spec.RayClusterSpec
+	default:
+		return nil
+	}
+}
+
+// applyRuntimeCountsAnnotation overrides worker-group PodSet counts from the
+// RayClusterPodsetReplicaSizesAnnotation, when present. It is the
+// manager-side fallback of UpdatePodSets for jobs whose runtime child
+// RayCluster lives only on the worker cluster.
+func applyRuntimeCountsAnnotation(log logr.Logger, podSets []kueue.PodSet, object client.Object) []kueue.PodSet {
+	if !features.Enabled(features.MultiKueueRayInTreeAutoscaling) {
+		return podSets
+	}
+	annotation := object.GetAnnotations()[RayClusterPodsetReplicaSizesAnnotation]
+	if annotation == "" {
+		return podSets
+	}
+	counts, err := parsePodSetReplicaSizes(annotation)
+	if err != nil {
+		log.V(2).Info("Ignoring malformed runtime replica-sizes annotation",
+			"rayObject", object.GetName(), "error", err.Error())
+		return podSets
+	}
+	var numOfHostsByGroup map[kueue.PodSetReference]int32
+	if spec := getRayClusterSpec(object); spec != nil {
+		numOfHostsByGroup = make(map[kueue.PodSetReference]int32, len(spec.WorkerGroupSpecs))
+		for i := range spec.WorkerGroupSpecs {
+			wgs := &spec.WorkerGroupSpecs[i]
+			numOfHostsByGroup[kueue.NewPodSetReference(wgs.GroupName)] = wgs.NumOfHosts
+		}
+	}
+	for i := range podSets {
+		if count, ok := counts[podSets[i].Name]; ok && count >= 0 && podSets[i].Count != count {
+			log.V(2).Info("Updated PodSet worker count from MultiKueue runtime annotation",
+				"rayObject", object.GetName(), "podSet", podSets[i].Name,
+				"oldCount", podSets[i].Count, "newCount", count)
+			podSets[i].Count = count
+			if features.Enabled(features.TopologyAwareScheduling) && podSets[i].Name != headGroupPodSetName {
+				numOfHosts := numOfHostsByGroup[podSets[i].Name]
+				replicas := count
+				if numOfHosts > 1 {
+					replicas = count / numOfHosts
+				}
+				if podSets[i].TopologyRequest == nil {
+					podSets[i].TopologyRequest = &kueue.PodSetTopologyRequest{}
+				}
+				podIndexLabel, subGroupIndexLabel := workerTopologyIndexLabels(new(replicas), numOfHosts)
+				podSets[i].TopologyRequest.PodIndexLabel = podIndexLabel
+				podSets[i].TopologyRequest.SubGroupIndexLabel = subGroupIndexLabel
+				podSets[i].TopologyRequest.SubGroupCount = new(replicas)
+			}
+		}
+	}
+	return podSets
+}
+
+// parsePodSetReplicaSizes parses the RayClusterPodsetReplicaSizesAnnotation value into a map.
 // Returns an empty map if the annotation is absent or empty.
-func ParsePodSetReplicaSizes(annotation string) (map[kueue.PodSetReference]int32, error) {
+func parsePodSetReplicaSizes(annotation string) (map[kueue.PodSetReference]int32, error) {
 	counts := make(map[kueue.PodSetReference]int32)
 	if annotation == "" {
 		return counts, nil
 	}
 	var podSets []jobframework.PodSetReplicaSize
 	if err := json.Unmarshal([]byte(annotation), &podSets); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal %s annotation: %w", RayClusterPodsetReplicaSizesAnnotation, err)
+		return nil, fmt.Errorf("%w: %w", errUnmarshalPodSetReplicaSizes, err)
 	}
 	for _, ps := range podSets {
 		counts[ps.Name] = ps.Count
 	}
 	return counts, nil
+}
+
+// WorkerGroupPodCounts returns the effective per-worker-group pod count of the
+// given RayClusterSpec, keyed by PodSet reference, matching BuildPodSets.
+func WorkerGroupPodCounts(spec *rayv1.RayClusterSpec) map[kueue.PodSetReference]int32 {
+	counts := make(map[kueue.PodSetReference]int32, len(spec.WorkerGroupSpecs))
+	for i := range spec.WorkerGroupSpecs {
+		wgs := &spec.WorkerGroupSpecs[i]
+		counts[kueue.NewPodSetReference(wgs.GroupName)] = effectiveWorkerCount(wgs)
+	}
+	return counts
+}
+
+// SetRuntimeWorkerStateAnnotations records the worker-side runtime replica
+// counts and a revision on the manager object as annotations:
+// RayClusterPodsetReplicaSizesAnnotation feeds the manager's PodSet
+// derivation and RayClusterGenerationAnnotation feeds the elastic workload-slice
+// name. Equality is decided on the counts alone, so count-neutral revision bumps
+// do not mint replacement slices. Returns whether any annotation changed.
+func SetRuntimeWorkerStateAnnotations(obj client.Object, result ray.FetchResult) bool {
+	serialized, err := serializeWorkerGroupCounts(result.Counts)
+	if err != nil {
+		// Counts are plain name/count pairs; serialization cannot realistically
+		// fail, but never propagate a broken value.
+		return false
+	}
+	annotations := obj.GetAnnotations()
+	if annotations[RayClusterPodsetReplicaSizesAnnotation] == serialized {
+		return false
+	}
+	if annotations == nil {
+		annotations = make(map[string]string, 2)
+	}
+	annotations[RayClusterPodsetReplicaSizesAnnotation] = serialized
+	annotations[RayClusterGenerationAnnotation] = result.Revision
+	obj.SetAnnotations(annotations)
+	return true
+}
+
+// ClearRuntimeWorkerStateAnnotations removes the worker runtime state reflected
+// on the manager object after preemption so that a subsequent admission starts
+// from the spec instead of stale runtime state.
+func ClearRuntimeWorkerStateAnnotations(obj client.Object) bool {
+	annotations := obj.GetAnnotations()
+	changed := false
+	for _, key := range []string{RayClusterPodsetReplicaSizesAnnotation, RayClusterGenerationAnnotation} {
+		if _, found := annotations[key]; found {
+			delete(annotations, key)
+			changed = true
+		}
+	}
+	if changed {
+		obj.SetAnnotations(annotations)
+	}
+	return changed
+}
+
+// serializeWorkerGroupCounts serializes per-group counts into the JSON format of
+// the replica-sizes annotations, sorted by name for a deterministic value.
+func serializeWorkerGroupCounts(counts map[kueue.PodSetReference]int32) (string, error) {
+	sizes := make([]jobframework.PodSetReplicaSize, 0, len(counts))
+	for name, count := range counts {
+		sizes = append(sizes, jobframework.PodSetReplicaSize{Name: name, Count: count})
+	}
+	slices.SortFunc(sizes, func(a, b jobframework.PodSetReplicaSize) int {
+		return strings.Compare(string(a.Name), string(b.Name))
+	})
+	out, err := json.Marshal(sizes)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 func GetWorkloadslicingRayClusterCustomAnnotations(ctx context.Context, c client.Client, jobObject client.Object, rayClusterName string) (map[string]string, error) {
@@ -431,7 +707,12 @@ func GetWorkloadslicingRayClusterCustomAnnotations(ctx context.Context, c client
 		}, &rayClusterObj)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				log.V(3).Info("RayCluster not found, skipping generation annotation", "rayCluster", rayClusterName)
+				log.V(3).Info("RayCluster not found, preserving any existing generation annotation", "rayCluster", rayClusterName)
+				// On a MultiKueue manager the child RayCluster only exists on the
+				// worker cluster and the generation annotation is maintained by
+				// the MultiKueue workload controller from the worker's child.
+				// Writing an empty value here would clobber it.
+				includeRayClusterGeneration = false
 			} else {
 				return nil, fmt.Errorf("failed to get RayCluster %s: %w", rayClusterName, err)
 			}
@@ -453,4 +734,19 @@ func GetWorkloadslicingRayClusterCustomAnnotations(ctx context.Context, c client
 func isStandaloneRayCluster(jobObject client.Object, rayClusterName string) bool {
 	_, isRayCluster := jobObject.(*rayv1.RayCluster)
 	return isRayCluster && rayClusterName != "" && jobObject.GetName() == rayClusterName
+}
+
+// ValidateElasticJobTopologyRequest rejects required or preferred topology on the
+// head and worker groups of an elastic Ray job, see
+// jobframeworktas.ValidateElasticJobTopologyRequest.
+func ValidateElasticJobTopologyRequest(object metav1.Object, rayClusterSpec *rayv1.RayClusterSpec, headGroupMetaPath, workerGroupSpecsPath *field.Path) field.ErrorList {
+	if rayClusterSpec == nil {
+		return nil
+	}
+	allErrs := jobframeworktas.ValidateElasticJobTopologyRequest(object, headGroupMetaPath, &rayClusterSpec.HeadGroupSpec.Template.ObjectMeta)
+	for i := range rayClusterSpec.WorkerGroupSpecs {
+		workerGroupMetaPath := workerGroupSpecsPath.Index(i).Child("template", "metadata")
+		allErrs = append(allErrs, jobframeworktas.ValidateElasticJobTopologyRequest(object, workerGroupMetaPath, &rayClusterSpec.WorkerGroupSpecs[i].Template.ObjectMeta)...)
+	}
+	return allErrs
 }

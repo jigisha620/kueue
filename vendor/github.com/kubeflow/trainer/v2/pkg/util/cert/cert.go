@@ -42,6 +42,11 @@ const (
 // it at a temporary directory.
 var certDir = "/tmp/k8s-webhook-server/serving-certs"
 
+// GetCertDir returns the directory that cert-controller writes serving
+// certificates into. Use this when configuring other servers (e.g. the
+// metrics server) that need to read from the same path.
+func GetCertDir() string { return certDir }
+
 func GetOperatorNamespace() string {
 	if data, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
 		if ns := strings.TrimSpace(string(data)); len(ns) > 0 {
@@ -52,8 +57,8 @@ func GetOperatorNamespace() string {
 }
 
 type Config struct {
-	WebhookServiceName                 string
-	WebhookSecretName                  string
+	ServiceName                        string
+	SecretName                         string
 	ValidatingWebhookConfigurationName string
 	MutatingWebhookConfigurationName   string
 }
@@ -67,12 +72,12 @@ func ManageCerts(mgr ctrl.Manager, cfg Config, setupFinished chan struct{}) erro
 
 	ns := GetOperatorNamespace()
 	// DNSName is <service name>.<namespace>.svc
-	dnsName := fmt.Sprintf("%s.%s.svc", cfg.WebhookServiceName, ns)
+	dnsName := fmt.Sprintf("%s.%s.svc", cfg.ServiceName, ns)
 
 	return cert.AddRotator(mgr, &cert.CertRotator{
 		SecretKey: types.NamespacedName{
 			Namespace: ns,
-			Name:      cfg.WebhookSecretName,
+			Name:      cfg.SecretName,
 		},
 		CertDir:        certDir,
 		CAName:         caName,

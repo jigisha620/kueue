@@ -50,6 +50,7 @@ const (
 )
 
 var errInvalidLeaderWorkerSetReplicas = errors.New("invalid LeaderWorkerSet replicas")
+var errInvalidMaxSurge = errors.New("invalid maxSurge")
 
 func RegisterIntegration(m *jobframework.IntegrationManager) error {
 	return m.RegisterIntegration(FrameworkName, jobframework.IntegrationCallbacks{
@@ -78,8 +79,10 @@ func (lws *LeaderWorkerSet) GVK() schema.GroupVersionKind {
 	return gvk
 }
 
-func SetupIndexes(context.Context, client.FieldIndexer) error {
-	return nil
+// SetupIndexes lets the MultiKueue controller find the Workloads of a
+// LeaderWorkerSet when it watches the local one.
+func SetupIndexes(ctx context.Context, indexer client.FieldIndexer) error {
+	return jobframework.SetupWorkloadOwnerIndex(ctx, indexer, gvk)
 }
 
 func validateLeaderWorkerSetReplicaCount(replicas int32) error {

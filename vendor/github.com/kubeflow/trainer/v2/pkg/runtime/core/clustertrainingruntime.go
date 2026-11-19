@@ -75,7 +75,7 @@ func (r *ClusterTrainingRuntime) NewObjects(ctx context.Context, trainJob *train
 		}
 	}
 
-	info, err := r.RuntimeInfo(trainJob, clTrainingRuntime.Spec.Template, clTrainingRuntime.Spec.MLPolicy, clTrainingRuntime.Spec.PodGroupPolicy)
+	info, err := r.RuntimeInfo(trainJob, clTrainingRuntime.Spec.Template, clTrainingRuntime.Spec.MLPolicy, clTrainingRuntime.Spec.PodGroupPolicy, clTrainingRuntime.Spec.Scheduling)
 	if err != nil {
 		return nil, err
 	}
@@ -84,8 +84,9 @@ func (r *ClusterTrainingRuntime) NewObjects(ctx context.Context, trainJob *train
 
 func (r *ClusterTrainingRuntime) RuntimeInfo(
 	trainJob *trainer.TrainJob, runtimeTemplateSpec any, mlPolicy *trainer.MLPolicy, podGroupPolicy *trainer.PodGroupPolicy,
+	scheduling *trainer.TrainingRuntimeScheduling,
 ) (*runtime.Info, error) {
-	return r.TrainingRuntime.RuntimeInfo(trainJob, runtimeTemplateSpec, mlPolicy, podGroupPolicy)
+	return r.TrainingRuntime.RuntimeInfo(trainJob, runtimeTemplateSpec, mlPolicy, podGroupPolicy, scheduling)
 }
 
 func (r *ClusterTrainingRuntime) TrainJobStatus(ctx context.Context, trainJob *trainer.TrainJob) (*trainer.TrainJobStatus, error) {
@@ -97,15 +98,31 @@ func (r *ClusterTrainingRuntime) EventHandlerRegistrars() []runtime.ReconcilerBu
 }
 
 func (r *ClusterTrainingRuntime) ValidateObjects(ctx context.Context, old, new *trainer.TrainJob) (admission.Warnings, field.ErrorList) {
+	// Validate against the snapshot the TrainJob was built from, falling back to the live
+	// runtime when no snapshot exists yet, as NewObjects does.
 	clusterTrainingRuntime := &trainer.ClusterTrainingRuntime{}
-	if err := r.client.Get(ctx, client.ObjectKey{
-		Name: new.Spec.RuntimeRef.Name,
-	}, clusterTrainingRuntime); err != nil {
-		return nil, field.ErrorList{
-			field.Invalid(field.NewPath("spec", "RuntimeRef"), new.Spec.RuntimeRef,
-				fmt.Sprintf("%v: specified clusterTrainingRuntime must be created before the TrainJob is created", err)),
+	if err := getRuntimeSnapshot(ctx, r.client, new, clusterTrainingRuntime); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, field.ErrorList{
+				field.InternalError(field.NewPath("spec", "runtimeRef"), fmt.Errorf("unable to get runtime snapshot: %w", err)),
+			}
+		}
+		clusterTrainingRuntime = &trainer.ClusterTrainingRuntime{}
+		if err := r.client.Get(ctx, client.ObjectKey{
+			Name: new.Spec.RuntimeRef.Name,
+		}, clusterTrainingRuntime); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return nil, field.ErrorList{
+					field.InternalError(field.NewPath("spec", "runtimeRef"), fmt.Errorf("unable to get clusterTrainingRuntime: %w", err)),
+				}
+			}
+			return nil, field.ErrorList{
+				field.Invalid(field.NewPath("spec", "runtimeRef"), new.Spec.RuntimeRef,
+					fmt.Sprintf("%v: specified clusterTrainingRuntime must be created before the TrainJob is created", err)),
+			}
 		}
 	}
+
 	var warnings admission.Warnings
 	if trainingruntime.IsSupportDeprecated(clusterTrainingRuntime.Labels) {
 		warnings = append(warnings, fmt.Sprintf(
@@ -114,7 +131,8 @@ func (r *ClusterTrainingRuntime) ValidateObjects(ctx context.Context, old, new *
 			constants.RuntimeDeprecationPolicyURL,
 		))
 	}
-	info, _ := r.newRuntimeInfo(new, clusterTrainingRuntime.Spec.Template, clusterTrainingRuntime.Spec.MLPolicy, clusterTrainingRuntime.Spec.PodGroupPolicy)
+
+	info, _ := r.newRuntimeInfo(new, clusterTrainingRuntime.Spec.Template, clusterTrainingRuntime.Spec.MLPolicy, clusterTrainingRuntime.Spec.PodGroupPolicy, clusterTrainingRuntime.Spec.Scheduling)
 	fwWarnings, errs := r.framework.RunCustomValidationPlugins(ctx, info, old, new)
 	if len(fwWarnings) != 0 {
 		warnings = append(warnings, fwWarnings...)

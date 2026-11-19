@@ -22,6 +22,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	"sigs.k8s.io/kueue/pkg/features"
 )
 
 func testPodSet(name string, count int32) kueue.PodSet {
@@ -68,6 +69,188 @@ func TestExtractPodSetCounts(t *testing.T) {
 	}
 }
 
+func TestExtractGrantedPodSetCounts(t *testing.T) {
+	tests := map[string]struct {
+		podSets           []kueue.PodSet
+		podSetsAssignment []kueue.PodSetAssignment
+		wantGranted       PodSetsCounts
+	}{
+		"EmptyPodSets": {
+			wantGranted: PodSetsCounts{},
+		},
+		"SinglePodSetAssignment": {
+			podSets: []kueue.PodSet{
+				{Name: kueue.NewPodSetReference("test"), Count: 20},
+			},
+			podSetsAssignment: []kueue.PodSetAssignment{
+				{
+					Name:  kueue.NewPodSetReference("test"),
+					Count: new(int32(10)),
+				},
+			},
+			wantGranted: PodSetsCounts{
+				"test": 10,
+			},
+		},
+		"MultiplePodSetAssignments": {
+			podSets: []kueue.PodSet{
+				{Name: kueue.NewPodSetReference("test-a"), Count: 20},
+				{Name: kueue.NewPodSetReference("test-b"), Count: 25},
+			},
+			podSetsAssignment: []kueue.PodSetAssignment{
+				{
+					Name:  kueue.NewPodSetReference("test-a"),
+					Count: new(int32(10)),
+				},
+				{
+					Name:  kueue.NewPodSetReference("test-b"),
+					Count: new(int32(11)),
+				},
+			},
+			wantGranted: PodSetsCounts{
+				"test-a": 10,
+				"test-b": 11,
+			},
+		},
+		"WorkloadAfterScaleDown": {
+			podSets: []kueue.PodSet{
+				{Name: kueue.NewPodSetReference("test-a"), Count: 10},
+				{Name: kueue.NewPodSetReference("test-b"), Count: 11},
+			},
+			podSetsAssignment: []kueue.PodSetAssignment{
+				{Name: kueue.NewPodSetReference("test-a"), Count: new(int32(20))},
+				{Name: kueue.NewPodSetReference("test-b"), Count: new(int32(25))},
+			},
+			wantGranted: PodSetsCounts{
+				"test-a": 10,
+				"test-b": 11,
+			},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			wl := &kueue.Workload{
+				Spec: kueue.WorkloadSpec{
+					PodSets: tt.podSets,
+				},
+				Status: kueue.WorkloadStatus{
+					Admission: &kueue.Admission{
+						PodSetAssignments: tt.podSetsAssignment,
+					},
+				},
+			}
+			if diff := cmp.Diff(ExtractGrantedPodSetCounts(wl), tt.wantGranted); diff != "" {
+				t.Errorf("ExtractPodSetAssignmentsCounts() got(-),want(+): %s", diff)
+			}
+		})
+	}
+}
+
+func TestExtractGrantedPodSetCountsAfterReclaim(t *testing.T) {
+	tests := map[string]struct {
+		podSets        []kueue.PodSet
+		admission      *kueue.Admission
+		reclaimable    []kueue.ReclaimablePod
+		reclaimGateOff bool
+		want           PodSetsCounts
+	}{
+		"NoAdmission": {
+			podSets: []kueue.PodSet{testPodSet("test", 3)},
+			want:    nil,
+		},
+		"FullGrantNoReclaim": {
+			podSets: []kueue.PodSet{testPodSet("test", 3)},
+			admission: &kueue.Admission{PodSetAssignments: []kueue.PodSetAssignment{
+				{Name: "test", Count: new(int32(3))},
+			}},
+			want: PodSetsCounts{"test": 3},
+		},
+		"PartialGrant": {
+			podSets: []kueue.PodSet{testPodSet("test", 5)},
+			admission: &kueue.Admission{PodSetAssignments: []kueue.PodSetAssignment{
+				{Name: "test", Count: new(int32(3))},
+			}},
+			want: PodSetsCounts{"test": 3},
+		},
+		"ReclaimedPodsReduceTheGrant": {
+			podSets: []kueue.PodSet{testPodSet("test", 3)},
+			admission: &kueue.Admission{PodSetAssignments: []kueue.PodSetAssignment{
+				{Name: "test", Count: new(int32(3))},
+			}},
+			reclaimable: []kueue.ReclaimablePod{{Name: "test", Count: 1}},
+			want:        PodSetsCounts{"test": 2},
+		},
+		"PartialGrantAlreadyBelowReclaimedCount": {
+			// granted 2 of 5, 1 reclaimed: after-reclaim count is 4, so the
+			// smaller grant wins.
+			podSets: []kueue.PodSet{testPodSet("test", 5)},
+			admission: &kueue.Admission{PodSetAssignments: []kueue.PodSetAssignment{
+				{Name: "test", Count: new(int32(2))},
+			}},
+			reclaimable: []kueue.ReclaimablePod{{Name: "test", Count: 1}},
+			want:        PodSetsCounts{"test": 2},
+		},
+		"InPlaceScaleDown": {
+			// admitted for 4, spec scaled down to 2: the stale assignment is
+			// capped by the current spec.
+			podSets: []kueue.PodSet{testPodSet("test", 2)},
+			admission: &kueue.Admission{PodSetAssignments: []kueue.PodSetAssignment{
+				{Name: "test", Count: new(int32(4))},
+			}},
+			want: PodSetsCounts{"test": 2},
+		},
+		"InPlaceScaleDownWithReclaim": {
+			podSets: []kueue.PodSet{testPodSet("test", 2)},
+			admission: &kueue.Admission{PodSetAssignments: []kueue.PodSetAssignment{
+				{Name: "test", Count: new(int32(4))},
+			}},
+			reclaimable: []kueue.ReclaimablePod{{Name: "test", Count: 1}},
+			want:        PodSetsCounts{"test": 1},
+		},
+		"ReclaimExceedingCountClampsToZero": {
+			podSets: []kueue.PodSet{testPodSet("test", 2)},
+			admission: &kueue.Admission{PodSetAssignments: []kueue.PodSetAssignment{
+				{Name: "test", Count: new(int32(2))},
+			}},
+			reclaimable: []kueue.ReclaimablePod{{Name: "test", Count: 5}},
+			want:        PodSetsCounts{"test": 0},
+		},
+		"MultiplePodSetsReclaimOnlyOne": {
+			podSets: []kueue.PodSet{testPodSet("head", 1), testPodSet("workers", 4)},
+			admission: &kueue.Admission{PodSetAssignments: []kueue.PodSetAssignment{
+				{Name: "head", Count: new(int32(1))},
+				{Name: "workers", Count: new(int32(4))},
+			}},
+			reclaimable: []kueue.ReclaimablePod{{Name: "workers", Count: 2}},
+			want:        PodSetsCounts{"head": 1, "workers": 2},
+		},
+		"ReclaimablePodsFeatureDisabledIgnoresReclaim": {
+			podSets: []kueue.PodSet{testPodSet("test", 3)},
+			admission: &kueue.Admission{PodSetAssignments: []kueue.PodSetAssignment{
+				{Name: "test", Count: new(int32(3))},
+			}},
+			reclaimable:    []kueue.ReclaimablePod{{Name: "test", Count: 1}},
+			reclaimGateOff: true,
+			want:           PodSetsCounts{"test": 3},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.ReclaimablePods, !tt.reclaimGateOff)
+			wl := &kueue.Workload{
+				Spec: kueue.WorkloadSpec{PodSets: tt.podSets},
+				Status: kueue.WorkloadStatus{
+					Admission:       tt.admission,
+					ReclaimablePods: tt.reclaimable,
+				},
+			}
+			if diff := cmp.Diff(tt.want, ExtractGrantedPodSetCountsAfterReclaim(wl)); diff != "" {
+				t.Errorf("ExtractGrantedPodSetCountsAfterReclaim() (-want,+got): %s", diff)
+			}
+		})
+	}
+}
+
 func TestExtractPodSetCountsFromWorkload(t *testing.T) {
 	type args struct {
 		workload *kueue.Workload
@@ -80,6 +263,7 @@ func TestExtractPodSetCountsFromWorkload(t *testing.T) {
 			args: args{
 				workload: &kueue.Workload{},
 			},
+			want: nil,
 		},
 		"SinglePodSet": {
 			args: args{

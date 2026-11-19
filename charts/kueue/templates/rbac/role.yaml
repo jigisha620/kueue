@@ -124,6 +124,22 @@ rules:
       - get
       - update
   - apiGroups:
+      - apiregistration.k8s.io
+    resources:
+      - apiservices
+    verbs:
+      - list
+      - watch
+  - apiGroups:
+      - apiregistration.k8s.io
+    resourceNames:
+      - v1beta2.visibility.kueue.x-k8s.io
+    resources:
+      - apiservices
+    verbs:
+      - get
+      - update
+  - apiGroups:
       - apps
     resources:
       - deployments
@@ -224,7 +240,13 @@ rules:
       - kubeflow.org
     resources:
       - jaxjobs
+      - mpijobs
+      - paddlejobs
+      - pytorchjobs
+      - tfjobs
+      - xgboostjobs
     verbs:
+      - delete
       - get
       - list
       - patch
@@ -256,21 +278,6 @@ rules:
       - patch
       - update
   - apiGroups:
-      - kubeflow.org
-    resources:
-      - mpijobs
-      - paddlejobs
-      - pytorchjobs
-      - tfjobs
-      - xgboostjobs
-    verbs:
-      - delete
-      - get
-      - list
-      - patch
-      - update
-      - watch
-  - apiGroups:
       - kueue.x-k8s.io
     resources:
       - admissionchecks
@@ -296,8 +303,10 @@ rules:
       - kueue.x-k8s.io
     resources:
       - admissionchecks/status
+      - capacityproviders/status
       - clusterqueues/status
       - cohorts/status
+      - dynamicquotaorchestrators/status
       - localqueues/status
       - multikueueclusters/status
       - workloads/status
@@ -308,10 +317,14 @@ rules:
   - apiGroups:
       - kueue.x-k8s.io
     resources:
+      - capacityproviders
       - cohorts
+      - dynamicquotaorchestrators
       - localqueues
+      - multikueuecapacityproviderconfigs
       - multikueueclusters
       - multikueueconfigs
+      - preemptionconfigs
       - provisioningrequestconfigs
       - workloadpriorityclasses
     verbs:
@@ -390,6 +403,7 @@ rules:
       - resource.k8s.io
     resources:
       - deviceclasses
+      - devicetaintrules
       - resourceclaims
       - resourceclaimtemplates
       - resourceslices
@@ -430,6 +444,7 @@ rules:
     resources:
       - trainjobs
     verbs:
+      - delete
       - get
       - list
       - patch

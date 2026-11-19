@@ -39,7 +39,8 @@ import (
 	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
 	"sigs.k8s.io/kueue/pkg/webhooks"
 	"sigs.k8s.io/kueue/test/integration/framework"
-	"sigs.k8s.io/kueue/test/util"
+	"sigs.k8s.io/kueue/test/util/behavioral"
+	"sigs.k8s.io/kueue/test/util/behavioral/integration"
 )
 
 var (
@@ -47,10 +48,13 @@ var (
 	k8sClient client.Client
 	ctx       context.Context
 	fwk       *framework.Framework
+	// managerClient reads the manager's cache, which is what effective-resource
+	// resolution reads.
+	managerClient client.Client
 )
 
 func TestAPIs(t *testing.T) {
-	util.RunSuite(t, "DRA Controller Suite")
+	behavioral.RunSuite(t, "DRA Controller Suite")
 }
 
 var _ = ginkgo.BeforeSuite(func() {
@@ -60,7 +64,7 @@ var _ = ginkgo.BeforeSuite(func() {
 	features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.KueueDRAIntegrationConsumableCapacity, true)
 
 	fwk = &framework.Framework{
-		WebhookPath: util.WebhookPath,
+		WebhookPath: behavioral.WebhookPath,
 		APIServerFeatureGates: []string{
 			"DynamicResourceAllocation=true",
 			"DRAExtendedResource=true",
@@ -81,9 +85,25 @@ var _ = ginkgo.AfterSuite(func() {
 	fwk.Teardown()
 })
 
+// expectLimitRangesInManagerCache waits until each LimitRange is visible to the
+// manager cache. Workload and LimitRange watches are not ordered, so a Workload
+// created immediately after a LimitRange can be scheduled from empty requests
+// and admitted before the defaults are applied.
+func expectLimitRangesInManagerCache(lrs ...*corev1.LimitRange) {
+	ginkgo.GinkgoHelper()
+	gomega.Eventually(func(g gomega.Gomega) {
+		for _, lr := range lrs {
+			g.Expect(managerClient.Get(ctx, client.ObjectKeyFromObject(lr), &corev1.LimitRange{})).To(gomega.Succeed())
+		}
+	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+}
+
 // Manager setup used by tests to start controllers with DRA ConfigMap configuration
 func managerSetup(modifyConfig func(*config.Configuration)) framework.ManagerSetup {
+	ginkgo.GinkgoHelper()
 	return func(ctx context.Context, mgr manager.Manager) {
+		managerClient = mgr.GetClient()
+
 		// Indexes
 		err := indexer.Setup(ctx, mgr.GetFieldIndexer())
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
@@ -125,6 +145,9 @@ func managerSetup(modifyConfig func(*config.Configuration)) framework.ManagerSet
 		draMapper := dra.NewResourceMapper()
 		err = draMapper.PopulateFromConfiguration(controllersCfg.Resources.DeviceClassMappings)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		if features.Enabled(features.KueueDRAExcludeDeviceClasses) {
+			draMapper.SetExcludedDeviceClasses(controllersCfg.Resources.ExcludeDeviceClassNames)
+		}
 		resourceFormatter := resources.NewResourceFormatter()
 		for _, resourceName := range draMapper.CounterBasedResourceNames() {
 			resourceFormatter.RegisterBinaryFormattedResource(resourceName)
@@ -138,7 +161,7 @@ func managerSetup(modifyConfig func(*config.Configuration)) framework.ManagerSet
 			qcache.WithDRABackedResources(draBackedResources),
 			qcache.WithResourceFormatter(resourceFormatter),
 		}
-		queues := util.NewManagerForIntegrationTests(ctx, mgr.GetClient(), cCache, queueOptions...)
+		queues := integration.NewManager(ctx, mgr.GetClient(), cCache, queueOptions...)
 
 		// Core controllers
 		failedCtrl, err := core.SetupControllers(

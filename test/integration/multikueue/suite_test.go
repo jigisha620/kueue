@@ -57,6 +57,7 @@ import (
 	workloadpytorchjob "sigs.k8s.io/kueue/pkg/controller/jobs/kubeflow/jobs/pytorchjob"
 	workloadtfjob "sigs.k8s.io/kueue/pkg/controller/jobs/kubeflow/jobs/tfjob"
 	workloadxgboostjob "sigs.k8s.io/kueue/pkg/controller/jobs/kubeflow/jobs/xgboostjob"
+	workloadleaderworkerset "sigs.k8s.io/kueue/pkg/controller/jobs/leaderworkerset"
 	workloadmpijob "sigs.k8s.io/kueue/pkg/controller/jobs/mpijob"
 	workloadpod "sigs.k8s.io/kueue/pkg/controller/jobs/pod"
 	workloadraycluster "sigs.k8s.io/kueue/pkg/controller/jobs/raycluster"
@@ -72,7 +73,8 @@ import (
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	"sigs.k8s.io/kueue/pkg/webhooks"
 	"sigs.k8s.io/kueue/test/integration/framework"
-	"sigs.k8s.io/kueue/test/util"
+	"sigs.k8s.io/kueue/test/util/behavioral"
+	"sigs.k8s.io/kueue/test/util/behavioral/integration"
 )
 
 const (
@@ -98,8 +100,10 @@ func (c *cluster) kubeConfigBytes() ([]byte, error) {
 	return utiltesting.RestConfigToKubeConfig(c.cfg)
 }
 
-func (c *cluster) StopAndTeardown() {
-	c.fwk.StopManager(c.ctx)
+func (c *cluster) stopAndTeardown() {
+	ctx, cancel := context.WithTimeout(c.ctx, behavioral.LongTimeout)
+	defer cancel()
+	c.fwk.StopManager(ctx)
 	c.fwk.Teardown()
 }
 
@@ -117,23 +121,32 @@ var (
 )
 
 func TestMultiKueue(t *testing.T) {
-	util.RunSuite(t, "MultiKueue Suite")
+	behavioral.RunSuite(t, "MultiKueue Suite")
+}
+
+var depCRDPathsWithoutClusterProfile = []string{
+	behavioral.JobsetCrds,
+	behavioral.TrainingOperatorCrds,
+	behavioral.MpiOperatorCrds,
+	behavioral.RayOperatorCrds,
+	behavioral.AppWrapperCrds,
+	behavioral.KfTrainerCrds,
+	behavioral.AutoscalerCrds,
+	behavioral.LeaderWorkerSetCrds,
 }
 
 func createCluster(setupFnc framework.ManagerSetup, apiFeatureGates ...string) cluster {
+	ginkgo.GinkgoHelper()
+	depCRDPaths := append([]string{behavioral.ClusterProfileCrds}, depCRDPathsWithoutClusterProfile...)
+	return createClusterWithDepCRDs(setupFnc, depCRDPaths, apiFeatureGates...)
+}
+
+func createClusterWithDepCRDs(setupFnc framework.ManagerSetup, depCRDPaths []string, apiFeatureGates ...string) cluster {
+	ginkgo.GinkgoHelper()
 	c := cluster{}
 	c.fwk = &framework.Framework{
-		WebhookPath: util.WebhookPath,
-		DepCRDPaths: []string{
-			util.JobsetCrds,
-			util.TrainingOperatorCrds,
-			util.MpiOperatorCrds,
-			util.RayOperatorCrds,
-			util.AppWrapperCrds,
-			util.KfTrainerCrds,
-			util.AutoscalerCrds,
-			util.ClusterProfileCrds,
-		},
+		WebhookPath:               behavioral.WebhookPath,
+		DepCRDPaths:               depCRDPaths,
 		APIServerFeatureGates:     apiFeatureGates,
 		APIServerAdmissionPlugins: []string{"MutatingAdmissionPolicy"},
 	}
@@ -151,6 +164,7 @@ func createCluster(setupFnc framework.ManagerSetup, apiFeatureGates ...string) c
 }
 
 func managerSetupWithResourceFormatter(formatter *resources.ResourceFormatter, cacheSink func(*schdcache.Cache)) framework.ManagerSetup {
+	ginkgo.GinkgoHelper()
 	return func(ctx context.Context, mgr manager.Manager) {
 		ctx = context.WithValue(ctx, managerSetupOptionsKey{}, managerSetupOptions{
 			resourceFormatter: formatter,
@@ -161,6 +175,7 @@ func managerSetupWithResourceFormatter(formatter *resources.ResourceFormatter, c
 }
 
 func resourceFormatterForCounterResource(resourceName corev1.ResourceName) *resources.ResourceFormatter {
+	ginkgo.GinkgoHelper()
 	mapper := dra.NewResourceMapper()
 	gomega.Expect(mapper.PopulateFromConfiguration([]config.DeviceClassMapping{
 		{
@@ -183,10 +198,12 @@ func resourceFormatterForCounterResource(resourceName corev1.ResourceName) *reso
 }
 
 func managerSetup(ctx context.Context, mgr manager.Manager) {
+	ginkgo.GinkgoHelper()
 	setupManager(ctx, mgr)
 }
 
 func setupManager(ctx context.Context, mgr manager.Manager) *jobframework.IntegrationManager {
+	ginkgo.GinkgoHelper()
 	options, _ := ctx.Value(managerSetupOptionsKey{}).(managerSetupOptions)
 	resourceFormatter := options.resourceFormatter
 	if resourceFormatter == nil {
@@ -206,7 +223,7 @@ func setupManager(ctx context.Context, mgr manager.Manager) *jobframework.Integr
 		qcache.WithPreemptionExpectations(preemptionExpecations),
 		qcache.WithResourceFormatter(resourceFormatter),
 	}
-	queues := util.NewManagerForIntegrationTests(ctx, mgr.GetClient(), cCache, queueOptions...)
+	queues := integration.NewManager(ctx, mgr.GetClient(), cCache, queueOptions...)
 	jobOptions := []jobframework.Option{
 		jobframework.WithIntegrationManager(integrationManager),
 		jobframework.WithCache(cCache),
@@ -226,6 +243,7 @@ func setupManager(ctx context.Context, mgr manager.Manager) *jobframework.Integr
 		workloadrayservice.FrameworkName,
 		workloadaw.FrameworkName,
 		workloadtrainjob.FrameworkName,
+		workloadleaderworkerset.FrameworkName,
 	} {
 		integrationManager.EnableIntegration(frameworkName)
 	}
@@ -457,6 +475,21 @@ func setupManager(ctx context.Context, mgr manager.Manager) *jobframework.Integr
 	err = workloadtrainjob.SetupTrainJobWebhook(mgr, jobOptions...)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
+	err = workloadleaderworkerset.SetupIndexes(ctx, mgr.GetFieldIndexer())
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+	lwsReconciler, err := workloadleaderworkerset.NewReconciler(
+		ctx,
+		mgr.GetClient(),
+		mgr.GetFieldIndexer(),
+		mgr.GetEventRecorder(constants.JobControllerName), jobOptions...)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	err = lwsReconciler.SetupWithManager(mgr)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+	err = workloadleaderworkerset.SetupWebhook(mgr, jobOptions...)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
 	err = provisioning.SetupIndexer(ctx, mgr.GetFieldIndexer())
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
@@ -477,7 +510,9 @@ func managerAndMultiKueueSetup(
 	gcInterval time.Duration,
 	enabledIntegrations sets.Set[string],
 	dispatcherName string,
+	extraOptions ...multikueue.SetupOption,
 ) {
+	ginkgo.GinkgoHelper()
 	integrationManager := setupManager(ctx, mgr)
 
 	err := multikueue.SetupIndexer(ctx, mgr.GetFieldIndexer(), managersConfigNamespace.Name)
@@ -486,13 +521,15 @@ func managerAndMultiKueueSetup(
 	adapters, err := integrationManager.GetMultiKueueAdapters(enabledIntegrations)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
-	err = multikueue.SetupControllers(mgr, managersConfigNamespace.Name,
+	controllerOptions := []multikueue.SetupOption{
 		multikueue.WithGCInterval(gcInterval),
 		multikueue.WithWorkerLostTimeout(testingWorkerLostTimeout),
-		multikueue.WithEventsBatchPeriod(250*time.Millisecond),
+		multikueue.WithEventsBatchPeriod(250 * time.Millisecond),
 		multikueue.WithAdapters(adapters),
 		multikueue.WithDispatcherName(dispatcherName),
-	)
+	}
+	controllerOptions = append(controllerOptions, extraOptions...)
+	err = multikueue.SetupControllers(mgr, managersConfigNamespace.Name, controllerOptions...)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 	configuration := &config.Configuration{
@@ -506,7 +543,7 @@ func managerAndMultiKueueSetup(
 }
 
 var _ = ginkgo.BeforeSuite(func() {
-	features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.MultiKueueManagerQuotaAutomation, true)
+	features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.DQOMultiKueueCapacityProvider, true)
 
 	ginkgo.By("creating the clusters", func() {
 		wg := sync.WaitGroup{}
@@ -542,10 +579,10 @@ var _ = ginkgo.BeforeSuite(func() {
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 	managersConfigNamespace = utiltesting.MakeNamespace("kueue-system")
-	util.MustCreate(managerTestCluster.ctx, managerTestCluster.client, managersConfigNamespace)
+	behavioral.MustCreate(managerTestCluster.ctx, managerTestCluster.client, managersConfigNamespace)
 
 	ginkgo.By("deploying MutatingAdmissionPolicy manifests to manager cluster", func() {
-		mapManifestPath := filepath.Join(util.ProjectBaseDir, "config", "components", "map", "manifests.yaml")
+		mapManifestPath := filepath.Join(behavioral.ProjectBaseDir, "config", "components", "map", "manifests.yaml")
 		manifestBytes, err := os.ReadFile(mapManifestPath)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
@@ -561,13 +598,13 @@ var _ = ginkgo.BeforeSuite(func() {
 			if len(rawObj.Object) == 0 {
 				continue
 			}
-			util.MustCreate(managerTestCluster.ctx, managerTestCluster.client, &rawObj)
+			behavioral.MustCreate(managerTestCluster.ctx, managerTestCluster.client, &rawObj)
 		}
 	})
 })
 
 var _ = ginkgo.AfterSuite(func() {
-	managerTestCluster.StopAndTeardown()
-	worker1TestCluster.StopAndTeardown()
-	worker2TestCluster.StopAndTeardown()
+	managerTestCluster.stopAndTeardown()
+	worker1TestCluster.stopAndTeardown()
+	worker2TestCluster.stopAndTeardown()
 })

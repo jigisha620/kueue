@@ -56,7 +56,6 @@ import (
 // replace semantics would absorb the duplicate, but the guard keeps the push and
 // its rollback paired to one reservation.
 func TestSecondPassDoesNotRepushEntryPenalty(t *testing.T) {
-	features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
 	features.SetFeatureGateDuringTest(t, features.AdmissionFairSharing, true)
 
 	now := time.Now().Truncate(time.Second)
@@ -126,7 +125,9 @@ func TestSecondPassDoesNotRepushEntryPenalty(t *testing.T) {
 			&kueue.LocalQueueList{Items: []kueue.LocalQueue{lq}}).
 		WithObjects(utiltesting.MakeNamespace("default"), &provCheck).
 		WithStatusSubresource(&kueue.Workload{}).
-		WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge})
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceApply: utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration,
+		})
 	if err := tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder)); err != nil {
 		t.Fatalf("setting up TAS indexes: %v", err)
 	}
@@ -150,7 +151,11 @@ func TestSecondPassDoesNotRepushEntryPenalty(t *testing.T) {
 		t.Fatalf("inserting localQueue in manager: %v", err)
 	}
 	// The reserved workload contributes its usage to the cache, mirroring production.
-	cqCache.AddOrUpdateWorkload(log, &wl)
+	storedWl := &kueue.Workload{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(&wl), storedWl); err != nil {
+		t.Fatalf("getting workload: %v", err)
+	}
+	cqCache.AddOrUpdateWorkload(t.Context(), log, storedWl)
 	if !qManager.QueueSecondPassIfNeeded(ctx, &wl, 0) {
 		t.Fatal("expected the workload to be queued for a second pass")
 	}

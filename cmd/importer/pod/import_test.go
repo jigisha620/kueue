@@ -26,7 +26,6 @@ import (
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
@@ -99,7 +98,7 @@ func TestImportNamespace(t *testing.T) {
 			Image("img").
 			Request(corev1.ResourceCPU, "1").
 			Request(corev1.ResourceName("nvidia.com/gpu"), "1").
-			PodIndexLabel(ptr.To(kueue.PodGroupPodIndexLabel)).
+			PodIndexLabel(new(kueue.PodGroupPodIndexLabel)).
 			Obj()).
 		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq1").
 			PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
@@ -135,6 +134,16 @@ func TestImportNamespace(t *testing.T) {
 				Obj(),
 		)
 
+	acceleratorClusterQueue := utiltestingapi.MakeClusterQueue("cq1").
+		ResourceGroup(
+			*utiltestingapi.MakeFlavorQuotas("rf-gpu").Resource(corev1.ResourceCPU, "10", "0").Obj(),
+			*utiltestingapi.MakeFlavorQuotas("rf-cpu").Resource(corev1.ResourceCPU, "10", "0").Obj(),
+		)
+	acceleratorFlavors := []kueue.ResourceFlavor{
+		*utiltestingapi.MakeResourceFlavor("rf-gpu").NodeLabel("accelerator", "gpu").Obj(),
+		*utiltestingapi.MakeResourceFlavor("rf-cpu").NodeLabel("accelerator", "cpu").Obj(),
+	}
+
 	podCmpOpts := cmp.Options{
 		cmpopts.EquateEmpty(),
 		cmpopts.IgnoreFields(metav1.ObjectMeta{}, "ResourceVersion"),
@@ -158,10 +167,29 @@ func TestImportNamespace(t *testing.T) {
 		addLabels       map[string]string
 		flavors         []kueue.ResourceFlavor
 		priorityClasses []schedulingv1.PriorityClass
-		wantPods        []corev1.Pod
-		wantWorkloads   []kueue.Workload
-		wantError       error
+		podListErr      error
+		// mapping defaults to baseMapping when not set.
+		mapping       mapping.Rules
+		wantPods      []corev1.Pod
+		wantWorkloads []kueue.Workload
+		wantError     error
 	}{
+		"returns an error when listing pods fails": {
+			pods: []corev1.Pod{
+				*basePodWrapper.DeepCopy(),
+			},
+			localQueue:   *baseLocalQueue.Obj(),
+			clusterQueue: *baseClusterQueue.Obj(),
+			flavors: []kueue.ResourceFlavor{
+				*utiltestingapi.MakeResourceFlavor("f1").Obj(),
+			},
+			podListErr: errPodList,
+			wantError:  errPodList,
+			wantPods: []corev1.Pod{
+				*basePodWrapper.DeepCopy(),
+			},
+			wantWorkloads: []kueue.Workload{},
+		},
 		"create one": {
 			pods: []corev1.Pod{
 				*basePodWrapper.DeepCopy(),
@@ -363,7 +391,7 @@ func TestImportNamespace(t *testing.T) {
 				*utiltestingapi.MakeResourceFlavor("f1").Obj(),
 			},
 			priorityClasses: []schedulingv1.PriorityClass{
-				{ObjectMeta: metav1.ObjectMeta{Name: "p-class"}, Value: 100},
+				{Name: "p-class", Value: 100},
 			},
 			wantPods: []corev1.Pod{
 				*basePodWrapper.Clone().PriorityClass("p-class").
@@ -376,7 +404,7 @@ func TestImportNamespace(t *testing.T) {
 					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
 						Image("img").
 						Request(corev1.ResourceCPU, "1").
-						PodIndexLabel(ptr.To(kueue.PodGroupPodIndexLabel)).
+						PodIndexLabel(new(kueue.PodGroupPodIndexLabel)).
 						PriorityClass("p-class").
 						Obj()).
 					PodPriorityClassRef("p-class").
@@ -399,6 +427,154 @@ func TestImportNamespace(t *testing.T) {
 			},
 			wantWorkloads: []kueue.Workload{},
 		},
+		"assigns the first flavor whose node labels match the pod's node selector": {
+			pods: []corev1.Pod{
+				*basePodWrapper.Clone().NodeSelector("accelerator", "cpu").Obj(),
+			},
+			localQueue:   *baseLocalQueue.Obj(),
+			clusterQueue: *acceleratorClusterQueue.Obj(),
+			flavors:      acceleratorFlavors,
+			wantPods: []corev1.Pod{
+				*basePodWrapper.Clone().
+					NodeSelector("accelerator", "cpu").
+					Label(controllerconstants.QueueLabel, "lq1").
+					ManagedByKueueLabel().
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*baseWlWrapper.Clone().
+					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
+						Image("img").
+						Request(corev1.ResourceCPU, "1").
+						NodeSelector(map[string]string{"accelerator": "cpu"}).
+						PodIndexLabel(new(kueue.PodGroupPodIndexLabel)).
+						Obj()).
+					Admission(utiltestingapi.MakeAdmission("cq1").
+						PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
+							Assignment(corev1.ResourceCPU, "rf-cpu", "1").
+							Obj()).
+						Obj()).
+					Obj(),
+			},
+		},
+		"assigns the first flavor whose node taints the pod tolerates": {
+			pods: []corev1.Pod{
+				*basePodWrapper.DeepCopy(),
+			},
+			localQueue: *baseLocalQueue.Obj(),
+			clusterQueue: *utiltestingapi.MakeClusterQueue("cq1").
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("tainted").Resource(corev1.ResourceCPU, "10", "0").Obj(),
+					*utiltestingapi.MakeFlavorQuotas("untainted").Resource(corev1.ResourceCPU, "10", "0").Obj(),
+				).Obj(),
+			flavors: []kueue.ResourceFlavor{
+				*utiltestingapi.MakeResourceFlavor("tainted").
+					Taint(corev1.Taint{Key: "maintenance", Effect: corev1.TaintEffectNoSchedule}).
+					Obj(),
+				*utiltestingapi.MakeResourceFlavor("untainted").Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.Clone().
+					Label(controllerconstants.QueueLabel, "lq1").
+					ManagedByKueueLabel().
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*baseWlWrapper.Clone().
+					Admission(utiltestingapi.MakeAdmission("cq1").
+						PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
+							Assignment(corev1.ResourceCPU, "untainted", "1").
+							Obj()).
+						Obj()).
+					Obj(),
+			},
+		},
+		"returns an error without mutating pod or creating workload when no flavor matches the pod's node selector": {
+			pods: []corev1.Pod{
+				*basePodWrapper.Clone().NodeSelector("accelerator", "tpu").Obj(),
+			},
+			localQueue:   *baseLocalQueue.Obj(),
+			clusterQueue: *acceleratorClusterQueue.Obj(),
+			flavors:      acceleratorFlavors,
+			wantError:    &noFeasibleFlavorError{Resource: corev1.ResourceCPU, ClusterQueue: "cq1"},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.Clone().NodeSelector("accelerator", "tpu").Obj(),
+			},
+			wantWorkloads: []kueue.Workload{},
+		},
+		"assigns the first flavor whose node labels match the pod's required node affinity": {
+			pods: []corev1.Pod{
+				*basePodWrapper.Clone().RequiredNodeSelectorRequirement("accelerator", corev1.NodeSelectorOpIn, "cpu").Obj(),
+			},
+			localQueue:   *baseLocalQueue.Obj(),
+			clusterQueue: *acceleratorClusterQueue.Obj(),
+			flavors:      acceleratorFlavors,
+			wantPods: []corev1.Pod{
+				*basePodWrapper.Clone().
+					RequiredNodeSelectorRequirement("accelerator", corev1.NodeSelectorOpIn, "cpu").
+					Label(controllerconstants.QueueLabel, "lq1").
+					ManagedByKueueLabel().
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*baseWlWrapper.Clone().
+					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
+						Image("img").
+						Request(corev1.ResourceCPU, "1").
+						RequiredNodeSelectorRequirement("accelerator", corev1.NodeSelectorOpIn, "cpu").
+						PodIndexLabel(new(kueue.PodGroupPodIndexLabel)).
+						Obj()).
+					Admission(utiltestingapi.MakeAdmission("cq1").
+						PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
+							Assignment(corev1.ResourceCPU, "rf-cpu", "1").
+							Obj()).
+						Obj()).
+					Obj(),
+			},
+		},
+		"returns an error without mutating pod or creating workload when no flavor matches the pod's required node affinity": {
+			pods: []corev1.Pod{
+				*basePodWrapper.Clone().RequiredNodeSelectorRequirement("accelerator", corev1.NodeSelectorOpIn, "tpu").Obj(),
+			},
+			localQueue:   *baseLocalQueue.Obj(),
+			clusterQueue: *acceleratorClusterQueue.Obj(),
+			flavors:      acceleratorFlavors,
+			wantError:    &noFeasibleFlavorError{Resource: corev1.ResourceCPU, ClusterQueue: "cq1"},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.Clone().RequiredNodeSelectorRequirement("accelerator", corev1.NodeSelectorOpIn, "tpu").Obj(),
+			},
+			wantWorkloads: []kueue.Workload{},
+		},
+		"imports only the pods requesting the resources listed in the mapping rule": {
+			pods: []corev1.Pod{
+				*baseGpuPodWrapper.DeepCopy(),
+				*basePodWrapper.DeepCopy(),
+			},
+			mapping: mapping.Rules{
+				{
+					Match: mapping.Match{
+						Labels:    map[string]string{testingQueueLabel: "q1"},
+						Resources: []corev1.ResourceName{testingGPUResource},
+					},
+					ToLocalQueue: "lq1",
+				},
+				{Skip: true},
+			},
+			localQueue:   *baseLocalQueue.Obj(),
+			clusterQueue: *cpuAndGpuClusterQueue.Obj(),
+			flavors: []kueue.ResourceFlavor{
+				*utiltestingapi.MakeResourceFlavor("cpu-flavor").Obj(),
+				*utiltestingapi.MakeResourceFlavor("gpu-flavor").Obj(),
+			},
+			wantPods: []corev1.Pod{
+				// The cpu-only Pod is skipped, so it keeps its original labels.
+				*basePodWrapper.DeepCopy(),
+				*baseGpuManagedPodWrapper.DeepCopy(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*baseGpuWlWrapper.DeepCopy(),
+			},
+		},
 	}
 
 	for name, tc := range cases {
@@ -409,14 +585,23 @@ func TestImportNamespace(t *testing.T) {
 			rfList := kueue.ResourceFlavorList{Items: tc.flavors}
 			pcList := schedulingv1.PriorityClassList{Items: tc.priorityClasses}
 
+			interceptorFuncs := interceptor.Funcs{SubResourceApply: utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration}
+			if tc.podListErr != nil {
+				interceptorFuncs.List = failPagedPodList(tc.podListErr).List
+			}
 			builder := utiltesting.NewClientBuilder().
-				WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge}).WithStatusSubresource(&kueue.Workload{}).
+				WithInterceptorFuncs(interceptorFuncs).WithStatusSubresource(&kueue.Workload{}).
 				WithLists(&podsList, &cqList, &lqList, &rfList, &pcList)
 
 			client := builder.Build()
 			ctx, _ := utiltesting.ContextWithLog(t)
 
-			mpc, err := cache.Load(ctx, client, []string{testingNamespace}, baseMapping, tc.addLabels, nil)
+			rules := tc.mapping
+			if rules == nil {
+				rules = baseMapping
+			}
+
+			mpc, err := cache.Load(ctx, client, []string{testingNamespace}, rules, tc.addLabels, nil)
 			if err != nil {
 				t.Fatalf("Unexpected cache load error: %s", err)
 			}

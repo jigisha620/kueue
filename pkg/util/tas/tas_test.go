@@ -20,6 +20,8 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+
+	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 )
 
 func TestBelongsTo(t *testing.T) {
@@ -121,6 +123,132 @@ func TestNodeNameFromDomainID(t *testing.T) {
 			}
 			if gotNodeName != tc.wantNodeName {
 				t.Errorf("NodeNameFromDomainID() nodeName = %q, want %q", gotNodeName, tc.wantNodeName)
+			}
+		})
+	}
+}
+
+func TestGroupKeyForPodSet(t *testing.T) {
+	cases := map[string]struct {
+		podSet *kueue.PodSet
+		want   PodSetGroupKey
+	}{
+		"no topology request": {
+			podSet: &kueue.PodSet{Name: "workers"},
+			want:   "podset/workers",
+		},
+		"topology request without group name": {
+			podSet: &kueue.PodSet{
+				Name:            "workers",
+				TopologyRequest: &kueue.PodSetTopologyRequest{Required: new(corev1.LabelHostname)},
+			},
+			want: "podset/workers",
+		},
+		"group name set": {
+			podSet: &kueue.PodSet{
+				Name:            "workers",
+				TopologyRequest: &kueue.PodSetTopologyRequest{PodSetGroupName: new("group-a")},
+			},
+			want: "podsetgroup/group-a",
+		},
+		// A group name may legitimately equal some other PodSet's name; the
+		// two must not collapse into one group. See TestGroupKeyForPodSetNameGroupNameCollision.
+		"group name equal to a PodSet name": {
+			podSet: &kueue.PodSet{
+				Name:            "workers",
+				TopologyRequest: &kueue.PodSetTopologyRequest{PodSetGroupName: new("leader")},
+			},
+			want: "podsetgroup/leader",
+		},
+		// A group name that itself looks like the PodSet prefix must still not
+		// collide, which is why the two prefixes are mutually non-prefixing.
+		"group name shaped like the PodSet prefix": {
+			podSet: &kueue.PodSet{
+				Name:            "workers",
+				TopologyRequest: &kueue.PodSetTopologyRequest{PodSetGroupName: new("podset/workers")},
+			},
+			want: "podsetgroup/podset/workers",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := GroupKeyForPodSet(tc.podSet); got != tc.want {
+				t.Errorf("GroupKeyForPodSet() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGroupKeyForPodSetNameGroupNameCollision pins the invariant the prefixes
+// exist for: a PodSet named "x" and a group named "x" must stay separate
+// groups. Without the prefixes all three PodSets below share one key, forming a
+// group of 3 that findLeaderAndWorkers cannot handle - and that
+// ValidatePodSetGroupingTopology accepts, because it counts only the PodSets
+// that declare the group name.
+func TestGroupKeyForPodSetNameGroupNameCollision(t *testing.T) {
+	podSetNamedX := &kueue.PodSet{Name: "x"}
+	inGroupX := &kueue.PodSet{
+		Name:            "b",
+		TopologyRequest: &kueue.PodSetTopologyRequest{PodSetGroupName: new("x")},
+	}
+	alsoInGroupX := &kueue.PodSet{
+		Name:            "c",
+		TopologyRequest: &kueue.PodSetTopologyRequest{PodSetGroupName: new("x")},
+	}
+
+	keyOfX := GroupKeyForPodSet(podSetNamedX)
+	keyOfB := GroupKeyForPodSet(inGroupX)
+	keyOfC := GroupKeyForPodSet(alsoInGroupX)
+
+	if keyOfX == keyOfB {
+		t.Errorf("PodSet %q and group %q must not share a key, both got %q",
+			podSetNamedX.Name, *inGroupX.TopologyRequest.PodSetGroupName, keyOfX)
+	}
+	if keyOfB != keyOfC {
+		t.Errorf("PodSets declaring the same group name must share a key, got %q and %q", keyOfB, keyOfC)
+	}
+}
+
+func TestIsUnconstrainedByDefault(t *testing.T) {
+	cases := map[string]struct {
+		tr   *kueue.PodSetTopologyRequest
+		want bool
+	}{
+		"no topology request": {
+			want: true,
+		},
+		"topology request without topology": {
+			tr:   &kueue.PodSetTopologyRequest{PodIndexLabel: new("index")},
+			want: true,
+		},
+		"slice topology only": {
+			tr: &kueue.PodSetTopologyRequest{
+				PodSetSliceRequiredTopology: new("cloud.com/rack"),
+				PodSetSliceSize:             new(int32(2)),
+			},
+			want: true,
+		},
+		"required topology": {
+			tr:   &kueue.PodSetTopologyRequest{Required: new("cloud.com/rack")},
+			want: false,
+		},
+		"preferred topology": {
+			tr:   &kueue.PodSetTopologyRequest{Preferred: new("cloud.com/block")},
+			want: false,
+		},
+		"unconstrained topology": {
+			tr:   &kueue.PodSetTopologyRequest{Unconstrained: new(true)},
+			want: false,
+		},
+		"unconstrained topology set to false": {
+			tr:   &kueue.PodSetTopologyRequest{Unconstrained: new(false)},
+			want: false,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := IsUnconstrainedByDefault(tc.tr); got != tc.want {
+				t.Errorf("IsUnconstrainedByDefault() = %t, want %t", got, tc.want)
 			}
 		})
 	}

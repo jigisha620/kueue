@@ -117,6 +117,32 @@ Controllers follow the controller-runtime reconciler pattern:
   func IsUnretryableError(e error) bool          { var target *unretryableError; return errors.As(e, &target) }
   ```
 
+- Expose errors that callers or tests need to distinguish as structured values,
+  not as message text. Use a sentinel for a fixed condition, and a typed error
+  with an `Is` method when the error carries data:
+
+  ```go
+  // Sentinel, see ErrCqNotFound in pkg/cache/scheduler.
+  var ErrCqNotFound = errors.New("cluster queue not found")
+
+  // Typed error, simplified from FilterBuildError in pkg/scheduler/preemption/config/filters.
+  type FilterBuildError struct{ Name string }
+
+  func (e *FilterBuildError) Error() string { return fmt.Sprintf("cannot build filter %q", e.Name) }
+  func (e *FilterBuildError) Is(target error) bool {
+      t, ok := target.(*FilterBuildError)
+      if !ok || t == nil || e == nil {
+          return false
+      }
+      return t.Name == e.Name
+  }
+  ```
+
+- Do not match on `err.Error()` with `==`, `strings.Contains`, or
+  `strings.HasPrefix`. It turns a cosmetic wording change into a failure in
+  every caller and test that asserted on it. A one-off error that is only
+  wrapped with `%w` and logged does not need a sentinel.
+
 ### Client Usage
 
 - **Prefer patch-based updates** over full object updates, especially for status:
@@ -229,6 +255,9 @@ Controllers follow the controller-runtime reconciler pattern:
 ---
 
 ## Test Code Guidelines
+
+Follow [Writing tests](/community/contribution_guidelines/writing_tests/) for
+coverage and test design. This section covers test syntax and conventions.
 
 ### Test Organization
 
@@ -353,18 +382,37 @@ This ensures log output is captured by the test framework and visible on failure
 Use `go-cmp/cmp` for comparing complex objects:
 
 ```go
-if diff := cmp.Diff(tc.wantError, gotError); diff != "" {
-    t.Errorf("unexpected reconcile error (-want/+got):\n%s", diff)
+if diff := cmp.Diff(tc.wantError, gotError, cmpopts.EquateErrors()); diff != "" {
+    t.Errorf("unexpected error (-want,+got):\n%s", diff)
 }
 ```
 
-Use predefined comparison options from `test/util/constants.go`:
+Compare errors by identity, not by message. `cmpopts.EquateErrors()` uses
+`errors.Is`, so `wantError` is a sentinel or a typed error with an `Is` method:
+
+```go
+// Avoid: breaks on any rewording of the message.
+if err == nil || !strings.Contains(err.Error(), "cluster queue not found") {
+    t.Errorf("unexpected error: %v", err)
+}
+
+// Prefer.
+tc := testCase{wantError: ErrCqNotFound}
+if diff := cmp.Diff(tc.wantError, gotError, cmpopts.EquateErrors()); diff != "" {
+    t.Errorf("unexpected error (-want,+got):\n%s", diff)
+}
+```
+
+Do not write a custom `cmp.Comparer` that falls back to comparing messages.
+Make the errors comparable with a sentinel or an `Is` method instead.
+
+Use predefined comparison options from `test/util/behavioral/constants.go`:
 
 ```go
 cmpOpts := cmp.Options{
     cmpopts.EquateEmpty(),
-    util.IgnoreConditionTimestamps,
-    util.IgnoreObjectMetaResourceVersion,
+    behavioral.IgnoreConditionTimestamps,
+    behavioral.IgnoreObjectMetaResourceVersion,
 }
 if diff := cmp.Diff(want, got, cmpOpts...); diff != "" {
     t.Errorf("unexpected result (-want,+got):\n%s", diff)
@@ -372,8 +420,8 @@ if diff := cmp.Diff(want, got, cmpOpts...); diff != "" {
 ```
 
 Common options:
-- `util.IgnoreConditionTimestamps` — ignore `LastTransitionTime` on conditions.
-- `util.IgnoreObjectMetaResourceVersion` — ignore `ResourceVersion` on
+- `behavioral.IgnoreConditionTimestamps` — ignore `LastTransitionTime` on conditions.
+- `behavioral.IgnoreObjectMetaResourceVersion` — ignore `ResourceVersion` on
   ObjectMeta.
 - `cmpopts.EquateEmpty()` — treat nil and empty slices/maps as equal.
 
@@ -385,7 +433,7 @@ Use `gomega.Eventually` for asynchronous assertions:
 gomega.Eventually(func(g gomega.Gomega) {
     g.Expect(k8sClient.Get(ctx, key, obj)).To(gomega.Succeed())
     g.Expect(obj.Status.Phase).To(gomega.Equal("Ready"))
-}, util.Timeout, util.Interval).Should(gomega.Succeed())
+}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 ```
 
 Use custom matchers from `pkg/util/testing/`:
@@ -402,7 +450,7 @@ var fwk *framework.Framework
 
 var _ = ginkgo.BeforeSuite(func() {
     fwk = &framework.Framework{
-        WebhookPath: util.WebhookPath,
+        WebhookPath: behavioral.WebhookPath,
     }
     cfg = fwk.Init()
     ctx, k8sClient = fwk.SetupClient(cfg)
@@ -419,7 +467,7 @@ var _ = ginkgo.AfterSuite(func() {
 
 ### Timeout Constants
 
-Use the predefined constants from `test/util/constants.go` for timeouts and polling intervals.
+Use the predefined constants from `test/util/behavioral/constants.go` for timeouts and polling intervals.
 
 ### Mocking and Error Injection
 
@@ -443,8 +491,8 @@ Follow this cleanup pattern:
 
 ```go
 ginkgo.AfterEach(func() {
-    gomega.Expect(util.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
-    util.ExpectObjectToBeDeleted(ctx, k8sClient, obj, true)
+    gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
+    behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, obj, true)
 })
 ```
 

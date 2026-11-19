@@ -17,24 +17,20 @@ limitations under the License.
 package workloaddispatcher
 
 import (
-	"context"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/component-base/featuregate"
 	testingclock "k8s.io/utils/clock/testing"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	kueueconfig "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
@@ -58,10 +54,13 @@ func TestIncrementalDispatcherReconciler_Reconcile(t *testing.T) {
 		wantErr        error
 		remoteClusters []string
 		clusters       []kueue.MultiKueueCluster
+		// wantRoundStartTimeCleared starts a nomination round for the Workload
+		// before Reconcile, and expects Reconcile to clear it.
+		wantRoundStartTimeCleared bool
 	}{
 		"workload not found": {
-			workload: nil,
-			wantErr:  apierrors.NewNotFound(schema.GroupResource{Group: kueue.SchemeGroupVersion.Group, Resource: "workloads"}, workloadName),
+			workload:                  nil,
+			wantRoundStartTimeCleared: true,
 		},
 		"workload deleted": {
 			workload: baseWorkload.Clone().DeletionTimestamp(now).Finalizers("kubernetes").Obj(),
@@ -160,11 +159,22 @@ func TestIncrementalDispatcherReconciler_Reconcile(t *testing.T) {
 				roundStartTimes: utilmaps.NewSyncMap[types.NamespacedName, time.Time](0),
 			}
 
-			req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: metav1.NamespaceDefault, Name: workloadName}}
+			req := ctrl.Request{Namespace: metav1.NamespaceDefault, Name: workloadName}
+			if tc.wantRoundStartTimeCleared {
+				rec.setRoundStartTime(req.NamespacedName, now.Add(-time.Minute))
+			}
 			ctx, _ := utiltesting.ContextWithLog(t)
-			_, gotErr := rec.Reconcile(ctx, req)
+			gotResult, gotErr := rec.Reconcile(ctx, req)
 			if diff := cmp.Diff(tc.wantErr, gotErr); diff != "" {
 				t.Errorf("Unexpected error (-want/+got)\n%s", diff)
+			}
+			if tc.wantRoundStartTimeCleared {
+				if diff := cmp.Diff(ctrl.Result{}, gotResult); diff != "" {
+					t.Errorf("Unexpected result (-want/+got)\n%s", diff)
+				}
+				if _, found := rec.getRoundStartTime(req.NamespacedName); found {
+					t.Error("Round start time was not cleared")
+				}
 			}
 		})
 	}
@@ -349,12 +359,7 @@ func TestIncrementalDispatcherNominateWorkers(t *testing.T) {
 
 			objs := []client.Object{tc.workload}
 			client := fake.NewClientBuilder().WithScheme(scheme).
-				WithInterceptorFuncs(interceptor.Funcs{
-					SubResourcePatch: func(ctx context.Context, client client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
-						tc.workload.Status.NominatedClusterNames = obj.(*kueue.Workload).Status.NominatedClusterNames
-						return utiltesting.TreatSSAAsStrategicMerge(ctx, client, subResourceName, obj, patch, opts...)
-					},
-				}).WithObjects(objs...).WithStatusSubresource(objs...).Build()
+				WithObjects(objs...).WithStatusSubresource(objs...).Build()
 
 			reconciler := &IncrementalDispatcherReconciler{
 				client:          client,
